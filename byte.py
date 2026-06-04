@@ -63,12 +63,13 @@ class ByteColor:
             "event":  self._ansi("0;37"),
             "header": self._ansi("1;37"),
             "plus":   self._ansi("1;37"),
-            "minus":  self._ansi("38;5;243"),
-            "tree":   self._ansi("38;5;239"),
+            "minus":  self._ansi("38;5;167"),  # rojo tenue — enlaces rotos
+            "tree":   self._ansi("38;5;238"),  # gris oscuro — líneas │ ├ └
+            "group":  self._ansi("38;5;250"),  # gris claro — nombre de grupo
             "count":  self._ansi("1;37"),
-            "date":   self._ansi("38;5;243"),
-            "link":   self._ansi("38;5;245"),
-            "warn":   self._ansi("33"),
+            "date":   self._ansi("38;5;243"),  # gris medio — metadatos
+            "link":   self._ansi("38;5;245"),  # gris claro — rutas origen
+            "warn":   self._ansi("33"),        # amarillo — GPG
         }
 
     def _ansi(self, code): return f"\033[{code}m"
@@ -382,10 +383,30 @@ class ByteInterface:
         return f"{g_render}{self.c.get('tree')}/{self.c.get('rst')}{e_render}"
 
     def _fmt_origin(self, path_str):
-        try:
-            return "~/" + str(Path(path_str).relative_to(Path.home()))
-        except ValueError:
-            return path_str
+        p = Path(path_str)
+        parts = p.parts
+        # …/padre/archivo.ext — nombre completo siempre visible
+        if len(parts) >= 2:
+            return f"…/{parts[-2]}/{parts[-1]}"
+        return path_str
+
+    def _render_grupo(self, nombre, abbrev, longitud):
+        """Renderiza el nombre de grupo: gris claro, abreviatura en blanco."""
+        c  = self.c
+        gc = c.get("group")  # gris claro
+        if not abbrev:
+            return f"{gc}{nombre}/{c.get('rst')}"
+        plano = "".join(ch for ch in unicodedata.normalize("NFKD", nombre.lower())
+                        if unicodedata.category(ch) != "Mn")
+        idx = plano.find(abbrev)
+        if idx != -1:
+            pre  = nombre[:idx]
+            lbl  = nombre[idx:idx+longitud]
+            post = nombre[idx+longitud:]
+            return (f"{gc}{pre}{c.get('rst')}"
+                    f"{c.get('bold')}{lbl}{c.get('rst')}"
+                    f"{gc}{post}/{c.get('rst')}")
+        return f"{gc}{nombre}/{c.get('bold')}{abbrev}{c.get('rst')}"
 
     def print_arbol(self, grupos_filter=None, show_dates=False):
         grupos = grupos_filter if grupos_filter is not None else self.storage.get_grupos()
@@ -393,12 +414,20 @@ class ByteInterface:
             print("  (vacío)"); return
 
         g_abbrevs = self.calc_abreviaturas(grupos, longitud=3)
+        tr = self.c.get("tree")
+        r  = self.c.get("rst")
 
         for gi, grupo in enumerate(grupos):
             is_last_g = gi == len(grupos) - 1
             g_pref    = "└── " if is_last_g else "├── "
-            print(f"{self.c.get('tree')}{g_pref}"
-                  f"{self._render_label(grupo + '/', g_abbrevs.get(grupo), longitud=3)}")
+
+            # línea en blanco antes de cada grupo (excepto el primero)
+            if gi > 0:
+                pad_prev = "    " if gi > 0 and (gi - 1 == len(grupos) - 1) else "│"
+                print(f"{tr}{'    ' if is_last_g else '│'}{r}")
+
+            print(f"{tr}{g_pref}{r}"
+                  f"{self._render_grupo(grupo, g_abbrevs.get(grupo), longitud=3)}")
 
             evs       = self.storage.get_eventos(grupo)
             e_abbrevs = self.calc_abreviaturas(evs, longitud=2)
@@ -416,35 +445,40 @@ class ByteInterface:
                 if ev_path:
                     real_ext = ev_path.suffix.lower()
                     if real_ext == ".gpg":
-                        ext_str = f"{self.c.get('date')}.gpg{self.c.get('rst')}"
+                        ext_str = f"{self.c.get('date')}.gpg{r}"
                     elif real_ext != ".md":
-                        ext_str = f"{self.c.get('date')}{real_ext}{self.c.get('rst')}"
+                        ext_str = f"{self.c.get('date')}{real_ext}{r}"
 
-                # indicadores
-                flags = ""
+                # indicadores compactos (g i) antes del origen
+                badges = ""
                 if self.storage.gpg.is_protected(grupo, stem):
-                    flags += f" {self.c.get('warn')}g{self.c.get('rst')}"
+                    badges += f" {self.c.get('warn')}g{r}"
                 if self.storage.info.has(grupo, stem):
-                    flags += f" {self.c.get('date')}i{self.c.get('rst')}"
+                    badges += f" {self.c.get('date')}i{r}"
+
+                # origen
+                origen_str = ""
                 if origin:
-                    es_copia    = self.storage.links.is_copy(grupo, stem)
-                    origen_fmt  = self._fmt_origin(origin)
-                    disponible  = Path(origin).is_file()
+                    es_copia   = self.storage.links.is_copy(grupo, stem)
+                    origen_fmt = self._fmt_origin(origin)
+                    disponible = Path(origin).is_file()
+                    sep = f"  {self.c.get('tree')}·{r}  "
                     if not disponible:
-                        # enlace roto: ruta en rojo tenue + ✗
-                        flags += f" {self.c.get('minus')}✗ → {origen_fmt}{self.c.get('rst')}"
+                        origen_str = f"{sep}{self.c.get('minus')}✗{r} {self.c.get('date')}{origen_fmt}{r}"
                     elif es_copia:
-                        flags += f" {self.c.get('date')}c{self.c.get('rst')} {self.c.get('link')}→ {origen_fmt}{self.c.get('rst')}"
+                        origen_str = f"{sep}{self.c.get('date')}c → {origen_fmt}{r}"
                     else:
-                        flags += f" {self.c.get('link')}→ {origen_fmt}{self.c.get('rst')}"
+                        origen_str = f"{sep}{self.c.get('date')}→ {origen_fmt}{r}"
+
+                fecha_str = ""
                 if show_dates:
                     mt = self.storage.mtime(ev_path)
                     if mt:
-                        flags += f"  {self.c.get('date')}{mt.strftime('%Y-%m-%d %H:%M')}{self.c.get('rst')}"
+                        fecha_str = f"  {self.c.get('date')}{mt.strftime('%Y-%m-%d %H:%M')}{r}"
 
-                print(f"{self.c.get('tree')}{pad}{e_pref}"
+                print(f"{tr}{pad}{e_pref}{r}"
                       f"{self._render_label(stem, e_abbrevs.get(stem), longitud=2)}"
-                      f"{ext_str}{flags}{self.c.get('rst')}")
+                      f"{ext_str}{badges}{origen_str}{fecha_str}")
 
     def pedir_grupo(self, label="Grupo"):
         grupos = self.storage.get_grupos()
@@ -544,7 +578,7 @@ class ByteApp:
         """Cifra path → path.gpg, borra el original. Devuelve path.gpg."""
         out = Path(str(path) + ".gpg")
         r = subprocess.run(
-            ["gpg", "--yes", "--batch", "-r", key_id, "-o", str(out), "-e", str(path)],
+            ["gpg", "--yes", "--batch", "--trust-model", "always", "-r", key_id, "-o", str(out), "-e", str(path)],
             capture_output=True)
         if r.returncode != 0:
             raise RuntimeError(r.stderr.decode())
@@ -900,9 +934,9 @@ class ByteApp:
         print(f"{self.c.get('plus')}✓ Movido: {r_src} ➔ {r_dest}{self.c.get('rst')}")
 
     def cmd_gpg(self, args):
-        """byte --gpg evento [key_id]
-        Marca el evento como protegido y lo cifra (o descifra si ya lo está).
-        Sin key_id usa el configurado en byte.toml.
+        """byte g evento [key_id ...]
+        Sin args sobre archivo ya cifrado: añade destinatario(s) adicionales.
+        Sobre archivo en claro: cifra. Para descifrar usar --nogpg.
         """
         if not shutil.which("gpg"):
             return print("gpg no está disponible en el sistema.")
@@ -911,10 +945,10 @@ class ByteApp:
             self.ui.print_arbol()
             entrada = self.ui.leer("Evento: ")
             if not entrada: return
-            key_arg = ""
+            extra_keys = []
         else:
-            entrada = args[0]
-            key_arg = args[1] if len(args) > 1 else ""
+            entrada  = args[0]
+            extra_keys = args[1:]  # destinatarios adicionales (correos/fingerprints)
 
         grupo, stem = self.resolver_arg(entrada)
         if not grupo:
@@ -925,31 +959,66 @@ class ByteApp:
             stem = self.ui.pedir_evento(grupo, "Evento")
             if not stem: return
 
-        ev_path = self.storage.get_evento_path(grupo, stem)
-
-        # Determinar llave
-        key_id = key_arg or self.gpg_key
-        if not key_id:
-            key_id = self.ui.leer("ID de llave GPG (email o fingerprint): ")
-            if not key_id: return
-
+        ev_path  = self.storage.get_evento_path(grupo, stem)
         ruta_fmt = self.ui.render_ruta(grupo, stem)
+        ya_cifrado = ev_path and ev_path.suffix.lower() == ".gpg"
 
-        # ¿Ya cifrado? → descifrar
-        if ev_path and ev_path.suffix.lower() == ".gpg":
-            if self.ui.leer(f"Descifrar {grupo}/{stem}? (s/n): ") != "s":
+        # ── Archivo ya cifrado: gestionar destinatarios ─────────────────
+        if ya_cifrado:
+            key_actual = self.storage.gpg.key_id(grupo, stem) or self.gpg_key
+            # destinatarios registrados actualmente
+            actuales = [k for k in (key_actual or "").split(",") if k]
+            d = self.c.get("date"); r2 = self.c.get("rst"); w = self.c.get("warn")
+            if actuales:
+                print(f"  {w}g{r2} destinatarios actuales:")
+                for k in actuales:
+                    print(f"    {d}{k}{r2}")
+
+            # keys pasadas por arg + las que se pidan interactivamente
+            nuevas = list(extra_keys)
+            while True:
+                resp = self.ui.leer("  Añadir llave (Enter para terminar): ")
+                if not resp:
+                    break
+                nuevas.append(resp)
+
+            if not nuevas:
+                print(f"{d}  Sin cambios.{r2}")
                 return
+
+            todos_keys = list(actuales)
+            for k in nuevas:
+                if k not in todos_keys:
+                    todos_keys.append(k)
+
             try:
                 tmp = self._gpg_decrypt_to_tmp(ev_path)
             except RuntimeError as e:
-                return print(f"GPG error: {e}")
+                return print(f"GPG error al descifrar: {e}")
             inner_ext = Path(ev_path.stem).suffix or ".md"
-            clear_path = ev_path.parent / f"{stem}{inner_ext}"
-            shutil.move(str(tmp), str(clear_path))
+            inner = ev_path.parent / f"{stem}{inner_ext}"
+            shutil.move(str(tmp), str(inner))
             ev_path.unlink()
-            self.storage.gpg.unmark(grupo, stem)
-            print(f"{self.c.get('plus')}~ {ruta_fmt}{self.c.get('rst')} (descifrado)")
+            r_args = []
+            for k in todos_keys:
+                r_args += ["-r", k]
+            out = Path(str(inner) + ".gpg")
+            res = subprocess.run(
+                ["gpg", "--yes", "--batch", "--trust-model", "always"] + r_args + ["-o", str(out), "-e", str(inner)],
+                capture_output=True)
+            inner.unlink(missing_ok=True)
+            if res.returncode != 0:
+                return print(f"GPG error al re-cifrar: {res.stderr.decode()}")
+            self.storage.gpg.mark(grupo, stem, ",".join(todos_keys))
+            print(f"{self.c.get('plus')}~ {ruta_fmt}{r2}"
+                  f"  {w}g{r2} → {('  ').join(todos_keys)}")
             return
+
+        # ── Cifrar archivo en claro ───────────────────────────────────────
+        key_id = (extra_keys[0] if extra_keys else None) or self.gpg_key
+        if not key_id:
+            key_id = self.ui.leer("ID de llave GPG (email o fingerprint): ")
+            if not key_id: return
 
         # No existe aún → crear vacío primero
         if not ev_path or not ev_path.is_file():
@@ -957,22 +1026,24 @@ class ByteApp:
             ev_path.parent.mkdir(parents=True, exist_ok=True)
             ev_path.touch()
 
-        # Cifrar — preservar registro de link si existe
-        link_origin  = self.storage.links.get(grupo, stem)
-        link_is_copy = self.storage.links.is_copy(grupo, stem)
-        try:
-            self._gpg_encrypt(ev_path, key_id)
-        except RuntimeError as e:
-            return print(f"GPG error: {e}")
+        all_keys = [key_id] + [k for k in extra_keys[1:] if k != key_id]
+        r_args = []
+        for k in all_keys:
+            r_args += ["-r", k]
+        out = Path(str(ev_path) + ".gpg")
+        res = subprocess.run(
+            ["gpg", "--yes", "--batch", "--trust-model", "always"] + r_args + ["-o", str(out), "-e", str(ev_path)],
+            capture_output=True)
+        if res.returncode != 0:
+            return print(f"GPG error: {res.stderr.decode()}")
+        ev_path.unlink()
 
-        self.storage.gpg.mark(grupo, stem, key_id)
-        # GPG destruye el archivo original y crea uno nuevo → el hardlink se rompe.
-        # Si tenía link (hardlink o copia), forzar copy=True para que check
-        # lo trate como copia sincronizable.
+        self.storage.gpg.mark(grupo, stem, ",".join(all_keys))
+        link_origin = self.storage.links.get(grupo, stem)
         if link_origin:
             self.storage.links.register(grupo, stem, Path(link_origin), es_copia=True)
         print(f"{self.c.get('plus')}~ {ruta_fmt}{self.c.get('rst')}"
-              f"  {self.c.get('warn')}g{self.c.get('rst')} cifrado con {key_id}")
+              f"  {self.c.get('warn')}g{self.c.get('rst')} cifrado → {'  '.join(all_keys)}")
 
     def cmd_nogpg(self, args):
         """Desprotege y descifra un evento GPG, deja el archivo en claro."""
