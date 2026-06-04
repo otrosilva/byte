@@ -1243,37 +1243,37 @@ class ByteApp:
         h = self.c.get("header"); t = self.c.get("tree")
         d = self.c.get("date");   r = self.c.get("rst")
         w = self.c.get("warn")
-        print(f"""{h}BYTE — Notas en Markdown{r}
-  {t}byte{r}                                   Árbol (grupos=3 letras, eventos=2 letras)
-  {t}byte -t{r}                                Árbol con fechas de modificación
-  {t}byte -h | --help{r}                       Esta ayuda
-
-  {h}Abrir / Añadir texto{r}
-  {t}byte [evento]{r}                          Abre en editor (crea .md si no existe)
-  {t}byte [evento] texto...{r}                 Añade línea al final
-  {t}byte [Grupo/evento]{r}                    Abre evento explícito
-
-  {h}Comandos{r}  {d}(--comando  o  letra sin guion){r}
-  {t}--link      l{r}  archivo [nombre]        Hardlink/copia → evento (mismo nombre o el que indiques)
-{t}--del       d{r}  [ruta]                  Envía al .trash/
-  {t}--mv        m{r}  [origen] [destino]      Mueve o fusiona
-  {t}--info      i{r}  [evento] [texto]        Muestra o establece info corta
-  {t}--gpg       g{r}  evento [key]            Cifra con GPG y protege el evento
-  {t}--nogpg     q{r}  evento                  Descifra y elimina la protección GPG
-  {t}--check     c{r}                          Detecta y sincroniza cambios (ambas direcciones)
-  {t}--unlink    u{r}  [evento]                Elimina el registro del enlace (archivos intactos)
-  {t}--config    x{r}                          Asistente de configuración inicial
-  {t}--dir        {r}                          Muestra rutas activas
-
-  {h}Árbol — indicadores{r}
-  {w}g{r}  protegido con GPG   {d}i{r}  tiene info   {d}c →{r}  copia   {d}→{r}  hardlink""")
+        print(f"{h}BYTE — Notas en Markdown{r}\n")
+        print(f"  {t}byte{r}              {d}árbol{r}")
+        print(f"  {t}byte -t{r}           {d}árbol con fechas{r}")
+        print(f"  {t}byte -h{r}           {d}esta ayuda{r}")
+        print()
+        print(f"  {h}Abrir / añadir{r}")
+        print(f"  {t}byte{r} {d}evento{r}              abre en editor  {d}(crea .md si no existe){r}")
+        print(f"  {t}byte{r} {d}evento{r} texto...      añade línea al final")
+        print(f"  {t}byte{r} {d}Grupo/evento{r}         abre evento explícito")
+        print()
+        print(f"  {h}Comandos{r}  {d}--comando  ·  letra{r}")
+        print(f"  {t}--link    {d}l{r}  archivo {d}[nombre]{r}    hardlink/copia → evento")
+        print(f"  {t}--del     {d}d{r}  {d}[ruta]{r}              envía al .trash/")
+        print(f"  {t}--mv      {d}m{r}  {d}[origen] [destino]{r}  mueve o fusiona")
+        print(f"  {t}--info    {d}i{r}  {d}[evento] [texto]{r}    muestra o establece nota corta")
+        print(f"  {t}--gpg     {d}g{r}  evento {d}[key]{r}        cifra con GPG")
+        print(f"  {t}--nogpg   {d}q{r}  evento              descifra y elimina protección GPG")
+        print(f"  {t}--check   {d}c{r}                      sincroniza cambios {d}(ambas direcciones){r}")
+        print(f"  {t}--unlink  {d}u{r}  {d}[evento]{r}            elimina registro del enlace")
+        print(f"  {t}--config  {d}x{r}                      configuración inicial")
+        print(f"  {t}--dir{r}                          rutas activas")
+        print()
+        print(f"  {h}Indicadores en el árbol{r}")
+        print(f"  {w}g{r} gpg   {d}i{r} info   {d}c →{r} copia   {d}→{r} hardlink   {d}✗ →{r} enlace roto")
 
 
 # ===== DISPATCH TABLE =====
 def build_dispatch(app):
     return {
         "link":      app.cmd_link,
-"del":       app.cmd_del,
+        "del":       app.cmd_del,
         "mv":        app.cmd_mv,
         "info":      app.cmd_info,
         "gpg":       app.cmd_gpg,
