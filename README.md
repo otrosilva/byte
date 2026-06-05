@@ -1,4 +1,11 @@
-# byte
+# bit.py
+
+Gestor de eventos tipo log, byte es basado en bit.py.
+
+Pendiente:
+- [ ] A futuro integrar en byte.py
+
+# byte.py
 
 Gestor de notas Markdown organizado en grupos/eventos. Guarda archivos en
 `Grupo/evento.md`, con soporte opcional de cifrado GPG y sincronización de
