@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# byte.py — gestor de notas Markdown en grupos/eventos (Linux/macOS)
+
 import os
 import sys
 import re
@@ -9,618 +11,689 @@ import tempfile
 import unicodedata
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any, Set
 
+# tomllib para leer TOML
 try:
-    import tomllib          # Python 3.11+
+    import tomllib
 except ImportError:
     try:
         import tomli as tomllib
     except ImportError:
         tomllib = None
 
-# ===== CONFIGURACIÓN =====
-CONFIG_DIR  = Path.home() / ".config" / "byte"
-CONFIG_PATH = CONFIG_DIR / "byte.toml"
+# ============================================================================
+# COLORES ANSI
+# ============================================================================
 
-def _load_config():
-    if not CONFIG_PATH.is_file():
-        return {}
-    if tomllib is None:
-        print("\033[38;5;243mAviso: byte.toml encontrado pero sin parser TOML "
-              "(Python < 3.11 y tomli no instalado). Usando valores por defecto.\033[0m",
-              file=sys.stderr)
-        return {}
-    with open(CONFIG_PATH, "rb") as f:
-        return tomllib.load(f)
-
-_CFG = _load_config()
-
-def _cfg_path(key, default):
-    raw = _CFG.get(key)
-    if raw is None:
-        return Path(str(default)).expanduser()
-    return Path(raw).expanduser()
-
-BASE   = _cfg_path("base",  Path.home() / "Documentos/Filen/Obsidian/bytes")
-LINKS  = _cfg_path("links", CONFIG_DIR / "links.json")
-INFO   = _cfg_path("info",  CONFIG_DIR / "info.json")
-EDITOR = _CFG.get("editor") or os.environ.get("MICRO_EDITOR") or os.environ.get("EDITOR", "micro")
-GPG_KEY= _CFG.get("gpg_key", "")
-
-TEXTO_PLANO = {
-    ".md", ".txt", ".csv", ".tsv", ".log", ".org", ".rst",
-    ".json", ".yaml", ".yml", ".toml", ".xml", ".html",
-    ".css", ".js", ".py", ".sh", ".lua", ".rb", ".go", ".rs",
+_ANSI = {
+    "rst":    "\033[0m",
+    "bold":   "\033[1;37m",
+    "event":  "\033[0;37m",
+    "header": "\033[1;37m",
+    "plus":   "\033[1;37m",
+    "minus":  "\033[38;5;167m",
+    "tree":   "\033[38;5;238m",
+    "group":  "\033[38;5;250m",
+    "count":  "\033[1;37m",
+    "date":   "\033[38;5;243m",
+    "link":   "\033[38;5;245m",
+    "warn":   "\033[33m",
 }
 
+def C(key: str) -> str:
+    return _ANSI.get(key, "")
 
-# ===== COLORES =====
-class ByteColor:
+# ============================================================================
+# CONFIGURACIÓN
+# ============================================================================
+
+class Config:
+    DEFAULT_BASE = Path.home() / "Documentos/Filen/Obsidian/bytes"
+    DEFAULT_EDITOR = os.environ.get("MICRO_EDITOR") or os.environ.get("EDITOR", "micro")
+
     def __init__(self):
-        self.codes = {
-            "rst":    self._ansi("0"),
-            "bold":   self._ansi("1;37"),
-            "event":  self._ansi("0;37"),
-            "header": self._ansi("1;37"),
-            "plus":   self._ansi("1;37"),
-            "minus":  self._ansi("38;5;167"),  # rojo tenue — enlaces rotos
-            "tree":   self._ansi("38;5;238"),  # gris oscuro — líneas │ ├ └
-            "group":  self._ansi("38;5;250"),  # gris claro — nombre de grupo
-            "count":  self._ansi("1;37"),
-            "date":   self._ansi("38;5;243"),  # gris medio — metadatos
-            "link":   self._ansi("38;5;245"),  # gris claro — rutas origen
-            "warn":   self._ansi("33"),        # amarillo — GPG
-        }
+        self.base: Path = self.DEFAULT_BASE
+        self.editor: str = self.DEFAULT_EDITOR
+        self.gpg_key: str = ""
+        self.gpg_keys_secondary: List[str] = []
+        self.used_config_path: Optional[Path] = None
+        self._load()
 
-    def _ansi(self, code): return f"\033[{code}m"
-    def get(self, key):    return self.codes.get(key, "")
+    def _load_toml_file(self, path: Path) -> Dict[str, Any]:
+        if not path.is_file() or tomllib is None:
+            return {}
+        with open(path, "rb") as f:
+            return tomllib.load(f)
 
+    def _create_default_config(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        contenido = f'base   = "{self.DEFAULT_BASE}"\neditor = "{self.DEFAULT_EDITOR}"\ngpg_key = ""\ngpg_keys_secondary = []\n'
+        path.write_text(contenido, encoding="utf-8")
 
-# ===== DIFF HELPER (compartido) =====
-def _diff_tool():
-    for t in ["delta", "bat"]:
-        if shutil.which(t): return t
+    def _load(self) -> None:
+        system_path = Path.home() / ".config" / "byte" / "byte.toml"
+        cfg = self._load_toml_file(system_path)
+        if cfg:
+            self.used_config_path = system_path
+        else:
+            vault_path = self.DEFAULT_BASE / ".byte" / "byte.toml"
+            cfg = self._load_toml_file(vault_path)
+            if cfg:
+                self.used_config_path = vault_path
+            else:
+                self._create_default_config(vault_path)
+                cfg = self._load_toml_file(vault_path)
+                self.used_config_path = vault_path
+                print(f"{C('date')}Configuración por defecto creada en {vault_path}{C('rst')}", file=sys.stderr)
+
+        if cfg:
+            raw_base = cfg.get("base")
+            if raw_base:
+                self.base = Path(raw_base).expanduser().resolve()
+            self.editor = cfg.get("editor") or self.DEFAULT_EDITOR
+            self.gpg_key = cfg.get("gpg_key", "")
+            raw_sec = cfg.get("gpg_keys_secondary", [])
+            if isinstance(raw_sec, str):
+                self.gpg_keys_secondary = [k.strip() for k in raw_sec.split(",") if k.strip()]
+            else:
+                self.gpg_keys_secondary = [str(k).strip() for k in raw_sec]
+
+    def save(self, base: Path, editor: str, gpg_key: str, gpg_keys_secondary: List[str]) -> None:
+        system_path = Path.home() / ".config" / "byte" / "byte.toml"
+        target = system_path if system_path.is_file() else self.base / ".byte" / "byte.toml"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        lines = [f'base   = "{base}"', f'editor = "{editor}"']
+        if gpg_key:
+            lines.append(f'gpg_key = "{gpg_key}"')
+        lines.append(f'gpg_keys_secondary = [{", ".join(f"\"{k}\"" for k in gpg_keys_secondary)}]' if gpg_keys_secondary else 'gpg_keys_secondary = []')
+        target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        self.base = base
+        self.editor = editor
+        self.gpg_key = gpg_key
+        self.gpg_keys_secondary = gpg_keys_secondary
+        self.used_config_path = target
+
+# ============================================================================
+# UTILIDADES
+# ============================================================================
+
+def _diff_tool() -> Optional[str]:
+    for tool in ("delta", "bat"):
+        if shutil.which(tool):
+            return tool
     return None
 
-def mostrar_diff(a, b):
+def mostrar_diff(a: Path, b: Path) -> None:
     tool = _diff_tool()
+    a_str, b_str = str(a), str(b)
     if tool == "delta":
-        os.system(f'diff -u "{a}" "{b}" | delta')
+        os.system(f'diff -u "{a_str}" "{b_str}" | delta')
     elif tool == "bat":
-        r = subprocess.run(["diff", "-u", str(a), str(b)], capture_output=True, text=True)
+        r = subprocess.run(["diff", "-u", a_str, b_str], capture_output=True, text=True)
         if r.stdout:
             tmp = tempfile.NamedTemporaryFile(suffix=".diff", delete=False, mode="w")
-            tmp.write(r.stdout); tmp.close()
+            tmp.write(r.stdout)
+            tmp.close()
             os.system(f'bat --language=diff "{tmp.name}"')
             Path(tmp.name).unlink()
         else:
             print("  (sin diferencias)")
     else:
-        os.system(f'diff -u "{a}" "{b}"')
+        os.system(f'diff -u "{a_str}" "{b_str}"')
 
+def _resaltar(texto: str, abrev: Optional[str], long: int, color_norm: str, color_res: str) -> str:
+    if not abrev:
+        return color_norm + texto + C("rst")
+    idx = texto.find(abrev)
+    if idx != -1:
+        pre = texto[:idx]
+        lbl = texto[idx:idx+long]
+        post = texto[idx+long:]
+        return f"{color_norm}{pre}{C('rst')}{color_res}{lbl}{C('rst')}{color_norm}{post}{C('rst')}"
+    return f"{color_norm}{texto} {color_res}{abrev}{C('rst')}"
 
-# ===== REGISTRO DE HARDLINKS =====
-class LinkRegistry:
-    """Clave: "Grupo/stem"  →  {"path": str, "copy": bool}
-    No usa inodos: sobrevive a cifrado GPG, mv y cualquier reescritura."""
+# ============================================================================
+# REGISTROS JSON (clase base)
+# ============================================================================
 
-    def __init__(self, base, links_path=None):
-        self.path  = Path(links_path) if links_path else Path(base) / ".links"
-        self._data = None
+class JsonRegistry:
+    def __init__(self, path: Path):
+        self.path = path
+        self._data: Optional[Any] = None
 
-    def _key(self, grupo, stem):
-        return f"{grupo}/{stem}"
+    def _load(self) -> None:
+        if self._data is not None:
+            return
+        if self.path.is_file():
+            try:
+                self._data = json.loads(self.path.read_text(encoding="utf-8"))
+            except Exception:
+                self._data = self._default_data()
+        else:
+            self._data = self._default_data()
 
-    def _load(self):
-        if self._data is None:
-            if self.path.is_file():
-                try:
-                    raw = json.loads(self.path.read_text(encoding="utf-8"))
-                    # migración: si las claves son numéricas (inodos viejos) descartamos
-                    self._data = {k: v for k, v in raw.items() if not k.isdigit()}
-                except Exception:
-                    self._data = {}
-            else:
-                self._data = {}
-
-    def _save(self):
-        self.path.write_text(json.dumps(self._data, indent=2, ensure_ascii=False),
-                             encoding="utf-8")
-
-    def register(self, grupo: str, stem: str, ruta: Path, es_copia: bool = False):
-        self._load()
-        self._data[self._key(grupo, stem)] = {"path": str(ruta), "copy": es_copia}
-        self._save()
-
-    def get(self, grupo: str, stem: str):
-        self._load()
-        entry = self._data.get(self._key(grupo, stem))
-        if entry is None: return None
-        return entry["path"] if isinstance(entry, dict) else entry
-
-    def is_copy(self, grupo: str, stem: str) -> bool:
-        self._load()
-        entry = self._data.get(self._key(grupo, stem))
-        if entry is None: return False
-        return entry.get("copy", False) if isinstance(entry, dict) else False
-
-    def remove(self, grupo: str, stem: str):
-        self._load()
-        self._data.pop(self._key(grupo, stem), None)
-        self._save()
-
-    def is_registered(self, grupo: str, stem: str) -> bool:
-        self._load()
-        return self._key(grupo, stem) in self._data
-
-    def origin(self, grupo: str, stem: str):
-        return self.get(grupo, stem)
-
-    def rename(self, g_src, s_src, g_dest, s_dest):
-        """Mueve el registro al renombrar/mover un evento."""
-        self._load()
-        entry = self._data.pop(self._key(g_src, s_src), None)
-        if entry:
-            self._data[self._key(g_dest, s_dest)] = entry
-            self._save()
-
-
-# ===== REGISTRO DE INFO =====
-class InfoRegistry:
-    def __init__(self, info_path):
-        self.path  = Path(info_path)
-        self._data = None
-
-    def _key(self, grupo, stem): return f"{grupo}/{stem}"
-
-    def _load(self):
-        if self._data is None:
-            if self.path.is_file():
-                try:
-                    self._data = json.loads(self.path.read_text(encoding="utf-8"))
-                except Exception:
-                    self._data = {}
-            else:
-                self._data = {}
-
-    def _save(self):
+    def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(self._data, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    def set(self, grupo, stem, texto):
+    def _default_data(self):
+        return {}
+
+    def _key(self, grupo: str, stem: str) -> str:
+        return f"{grupo}/{stem}"
+
+
+class LinkRegistry(JsonRegistry):
+    def add_origin(self, grupo: str, stem: str, ruta: Path, es_copia: bool = False) -> None:
+        self._load()
+        key = self._key(grupo, stem)
+        entry = {"path": str(ruta), "copy": es_copia}
+        if key not in self._data:
+            self._data[key] = []
+        if entry not in self._data[key]:
+            self._data[key].append(entry)
+            self._save()
+
+    def remove_origin(self, grupo: str, stem: str, ruta: Path) -> None:
+        self._load()
+        key = self._key(grupo, stem)
+        if key in self._data:
+            self._data[key] = [e for e in self._data[key] if e["path"] != str(ruta)]
+            if not self._data[key]:
+                del self._data[key]
+            self._save()
+
+    def remove_all_origins(self, grupo: str, stem: str) -> None:
+        self._load()
+        key = self._key(grupo, stem)
+        if key in self._data:
+            del self._data[key]
+            self._save()
+
+    def get_origins(self, grupo: str, stem: str) -> List[Dict[str, Any]]:
+        self._load()
+        return self._data.get(self._key(grupo, stem), [])
+
+    def rename(self, g_src: str, s_src: str, g_dst: str, s_dst: str) -> None:
+        self._load()
+        key_src = self._key(g_src, s_src)
+        key_dst = self._key(g_dst, s_dst)
+        if key_src in self._data:
+            self._data[key_dst] = self._data.pop(key_src)
+            self._save()
+
+
+class InfoRegistry(JsonRegistry):
+    def set(self, grupo: str, stem: str, texto: str) -> None:
         self._load()
         self._data[self._key(grupo, stem)] = texto.strip()
         self._save()
 
-    def get(self, grupo, stem):
+    def get(self, grupo: str, stem: str) -> Optional[str]:
         self._load()
         return self._data.get(self._key(grupo, stem))
 
-    def remove(self, grupo, stem):
+    def remove(self, grupo: str, stem: str) -> None:
         self._load()
         self._data.pop(self._key(grupo, stem), None)
         self._save()
 
-    def has(self, grupo, stem):
-        self._load()
-        return self._key(grupo, stem) in self._data
+    def has(self, grupo: str, stem: str) -> bool:
+        return self.get(grupo, stem) is not None
 
 
-# ===== REGISTRO GPG =====
-class GpgRegistry:
-    """Persiste qué eventos están marcados como protegidos con GPG."""
-    def __init__(self, config_dir):
-        self.path  = Path(config_dir) / "gpg.json"
-        self._data = None
-
-    def _load(self):
-        if self._data is None:
-            if self.path.is_file():
-                try:
-                    self._data = json.loads(self.path.read_text(encoding="utf-8"))
-                except Exception:
-                    self._data = {}
-            else:
-                self._data = {}
-
-    def _save(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self._data, indent=2, ensure_ascii=False), encoding="utf-8")
-
-    def _key(self, grupo, stem): return f"{grupo}/{stem}"
-
-    def mark(self, grupo, stem, key_id: str):
+class GpgRegistry(JsonRegistry):
+    def mark(self, grupo: str, stem: str, key_id: str) -> None:
         self._load()
         self._data[self._key(grupo, stem)] = key_id
         self._save()
 
-    def unmark(self, grupo, stem):
+    def unmark(self, grupo: str, stem: str) -> None:
         self._load()
         self._data.pop(self._key(grupo, stem), None)
         self._save()
 
-    def is_protected(self, grupo, stem) -> bool:
+    def is_protected(self, grupo: str, stem: str) -> bool:
         self._load()
         return self._key(grupo, stem) in self._data
 
-    def key_id(self, grupo, stem):
+    def key_id(self, grupo: str, stem: str) -> Optional[str]:
         self._load()
         return self._data.get(self._key(grupo, stem))
 
+# ============================================================================
+# ALMACENAMIENTO (case‑sensitive)
+# ============================================================================
 
-# ===== ALMACENAMIENTO =====
 class ByteStorage:
-    def __init__(self, base_path, links_path=None, info_path=None, config_dir=None):
-        self.base    = Path(base_path)
-        self.links   = LinkRegistry(self.base, links_path=links_path)
-        self.info    = InfoRegistry(info_path or (CONFIG_DIR / "info.json"))
-        self.gpg     = GpgRegistry(config_dir or CONFIG_DIR)
+    def __init__(self, base: Path):
+        self.base = base
+        byte_dir = base / ".byte"
+        self.links = LinkRegistry(byte_dir / "links.json")
+        self.info = InfoRegistry(byte_dir / "info.json")
+        self.gpg = GpgRegistry(byte_dir / "gpg.json")
 
-    def asegurar_base(self):
+    def asegurar_base(self) -> None:
         self.base.mkdir(parents=True, exist_ok=True)
-        self.links.path.parent.mkdir(parents=True, exist_ok=True)
+        (self.base / ".byte").mkdir(parents=True, exist_ok=True)
 
-    def normalize(self, txt):
+    def normalize(self, txt: str) -> str:
         txt = txt.lower()
-        return "".join(c for c in unicodedata.normalize("NFKD", txt)
-                       if unicodedata.category(c) != "Mn")
+        return "".join(c for c in unicodedata.normalize("NFKD", txt) if unicodedata.category(c) != "Mn")
 
-    def titulo(self, txt):
+    def titulo(self, txt: str) -> str:
         return txt.strip().capitalize()
 
-    def get_grupos(self):
-        if not self.base.is_dir(): return []
-        return sorted([d.name for d in self.base.iterdir()
-                       if d.is_dir() and not d.name.startswith(".")])
+    def get_grupos(self) -> List[str]:
+        if not self.base.is_dir():
+            return []
+        return sorted(d.name for d in self.base.iterdir() if d.is_dir() and not d.name.startswith("."))
 
-    def get_eventos(self, grupo):
+    def get_eventos(self, grupo: str) -> List[str]:
         gp = self.base / grupo
-        if not gp.is_dir(): return []
-        resultado = []
+        if not gp.is_dir():
+            return []
+        stems = []
         for f in sorted(gp.iterdir()):
-            if f.name.startswith("."): continue
+            if f.name.startswith("."):
+                continue
             ext = f.suffix.lower()
-            if ext in TEXTO_PLANO or ext == ".gpg":
-                resultado.append(f.stem if ext != ".gpg" else Path(f.stem).stem)
-        return list(dict.fromkeys(resultado))  # dedup preservando orden
+            if ext in (".md", ".txt", ".py", ".sh", ".gpg"):
+                stem = f.stem if ext != ".gpg" else Path(f.stem).stem
+                stems.append(stem)
+        seen = set()
+        unicos = []
+        for s in stems:
+            norm = self.normalize(s)
+            if norm not in seen:
+                seen.add(norm)
+                unicos.append(s)
+        return unicos
 
-    def get_evento_path(self, grupo, stem):
+    def get_evento_path(self, grupo: str, stem: str) -> Optional[Path]:
         gp = self.base / grupo
-        if not gp.is_dir(): return None
-        # buscar primero .gpg cifrado, luego texto plano
+        if not gp.is_dir():
+            return None
         for f in gp.iterdir():
-            if f.name.startswith("."): continue
-            # archivo cifrado: stem.md.gpg → stem
-            if f.suffix.lower() == ".gpg" and Path(f.stem).stem == stem:
-                return f
-            if f.stem == stem and f.suffix.lower() in TEXTO_PLANO:
-                return f
+            if f.name.startswith("."):
+                continue
+            ext = f.suffix.lower()
+            if ext == ".gpg":
+                if Path(f.stem).stem == stem:
+                    return f
+            elif ext in (".md", ".txt", ".py", ".sh"):
+                if f.stem == stem:
+                    return f
         return None
 
-    def grupo_path(self, grupo):
+    def grupo_path(self, grupo: str) -> Path:
         return self.base / self.titulo(grupo)
 
-    def evento_path(self, grupo, stem, ext=".md"):
+    def evento_path(self, grupo: str, stem: str, ext: str = ".md") -> Path:
         return self.base / self.titulo(grupo) / f"{stem}{ext}"
 
-    def trash(self, path):
-        if not path.exists(): return
+    def trash(self, path: Path) -> None:
+        if not path.exists():
+            return
         trash_dir = self.base / ".trash"
         trash_dir.mkdir(exist_ok=True)
         dest = trash_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{path.name}"
-        shutil.move(str(path), str(dest))
+        shutil.move(path, dest)
 
-    def mtime(self, path):
-        if not path or not path.is_file(): return None
+    def mtime(self, path: Optional[Path]) -> Optional[datetime]:
+        if not path or not path.is_file():
+            return None
         return datetime.fromtimestamp(path.stat().st_mtime)
 
-    def limpiar_vacios(self):
+    def limpiar_vacios(self) -> None:
         for g in self.get_grupos():
             gp = self.grupo_path(g)
             if gp.is_dir() and not any(f for f in gp.iterdir() if not f.name.startswith(".")):
                 gp.rmdir()
 
+    # --- GPG helpers ---
+    def leer_evento(self, grupo: str, stem: str) -> Optional[str]:
+        path = self.get_evento_path(grupo, stem)
+        if not path or not path.is_file():
+            return None
+        if path.suffix.lower() == ".gpg":
+            try:
+                tmp = self._gpg_decrypt_to_tmp(path)
+                contenido = tmp.read_text(encoding="utf-8")
+                tmp.unlink()
+                return contenido
+            except RuntimeError:
+                return None
+        return path.read_text(encoding="utf-8")
 
-# ===== INTERFAZ VISUAL =====
-class ByteInterface:
-    def __init__(self, storage, color):
-        self.storage = storage
-        self.c       = color
+    def escribir_evento(self, grupo: str, stem: str, contenido: str,
+                        key_id: Optional[str] = None, cifrar: bool = True) -> None:
+        ev_path = self.get_evento_path(grupo, stem)
+        if cifrar:
+            if key_id is None:
+                key_id = self.gpg.key_id(grupo, stem)
+            debe_cifrar = key_id is not None
+        else:
+            debe_cifrar = False
 
-    def leer(self, prompt):
+        if not ev_path:
+            ext = ".gpg" if debe_cifrar else ".md"
+            ev_path = self.evento_path(grupo, stem, ext=ext)
+        ev_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False, encoding="utf-8") as tf:
+            tf.write(contenido)
+            tmp_path = Path(tf.name)
+
         try:
-            return input(prompt).strip()
-        except (KeyboardInterrupt, EOFError):
-            print(f"\n  {self.c.get('tree')}(Interrumpido){self.c.get('rst')}\n")
-            sys.exit(0)
+            if debe_cifrar:
+                self._gpg_encrypt(tmp_path, key_id, ev_path)
+            else:
+                shutil.copy2(tmp_path, ev_path)
+        finally:
+            tmp_path.unlink()
 
-    def calc_abreviaturas(self, lista, longitud):
-        abbrevs = {}
-        usados  = set()
-        for item in lista:
-            plano = self.storage.normalize(item)
-            asignado = False
-            for i in range(len(plano) - longitud + 1):
-                sub = plano[i:i+longitud]
-                if " " not in sub and sub not in usados:
-                    abbrevs[item] = sub
-                    usados.add(sub)
-                    asignado = True
-                    break
-            if not asignado:
-                for i in range(len(plano) - longitud + 1):
-                    sub = plano[i:i+longitud]
-                    if " " not in sub:
-                        abbrevs[item] = sub
-                        break
-        return abbrevs
-
-    def _render_label(self, nombre, abbrev, longitud):
-        c     = self.c
-        color = c.get("event")
-        if not abbrev:
-            return color + nombre + c.get("rst")
-        plano = "".join(ch for ch in unicodedata.normalize("NFKD", nombre.lower())
-                        if unicodedata.category(ch) != "Mn")
-        idx = plano.find(abbrev)
-        if idx != -1:
-            pre  = nombre[:idx]
-            lbl  = nombre[idx:idx+longitud]
-            post = nombre[idx+longitud:]
-            return (f"{color}{pre}{c.get('rst')}"
-                    f"{c.get('bold')}{lbl}{c.get('rst')}"
-                    f"{color}{post}{c.get('rst')}")
-        return f"{color}{nombre} {c.get('bold')}{abbrev}{c.get('rst')}"
-
-    def render_ruta(self, grupo, stem):
-        grupos    = self.storage.get_grupos()
-        g_abbrevs = self.calc_abreviaturas(grupos, longitud=3)
-        g_render  = self._render_label(grupo, g_abbrevs.get(grupo), longitud=3)
-        evs       = self.storage.get_eventos(grupo)
-        if stem not in evs: evs = evs + [stem]
-        e_abbrevs = self.calc_abreviaturas(evs, longitud=2)
-        e_render  = self._render_label(stem, e_abbrevs.get(stem), longitud=2)
-        return f"{g_render}{self.c.get('tree')}/{self.c.get('rst')}{e_render}"
-
-    def _fmt_origin(self, path_str):
-        p = Path(path_str)
-        parts = p.parts
-        # …/padre/archivo.ext — nombre completo siempre visible
-        if len(parts) >= 2:
-            return f"…/{parts[-2]}/{parts[-1]}"
-        return path_str
-
-    def _render_grupo(self, nombre, abbrev, longitud):
-        """Renderiza el nombre de grupo: gris claro, abreviatura en blanco."""
-        c  = self.c
-        gc = c.get("group")  # gris claro
-        if not abbrev:
-            return f"{gc}{nombre}/{c.get('rst')}"
-        plano = "".join(ch for ch in unicodedata.normalize("NFKD", nombre.lower())
-                        if unicodedata.category(ch) != "Mn")
-        idx = plano.find(abbrev)
-        if idx != -1:
-            pre  = nombre[:idx]
-            lbl  = nombre[idx:idx+longitud]
-            post = nombre[idx+longitud:]
-            return (f"{gc}{pre}{c.get('rst')}"
-                    f"{c.get('bold')}{lbl}{c.get('rst')}"
-                    f"{gc}{post}/{c.get('rst')}")
-        return f"{gc}{nombre}/{c.get('bold')}{abbrev}{c.get('rst')}"
-
-    def print_arbol(self, grupos_filter=None, show_dates=False):
-        grupos = grupos_filter if grupos_filter is not None else self.storage.get_grupos()
-        if not grupos:
-            print("  (vacío)"); return
-
-        g_abbrevs = self.calc_abreviaturas(grupos, longitud=3)
-        tr = self.c.get("tree")
-        r  = self.c.get("rst")
-
-        for gi, grupo in enumerate(grupos):
-            is_last_g = gi == len(grupos) - 1
-            g_pref    = "└── " if is_last_g else "├── "
-
-            # línea en blanco antes de cada grupo (excepto el primero)
-            if gi > 0:
-                pad_prev = "    " if gi > 0 and (gi - 1 == len(grupos) - 1) else "│"
-                print(f"{tr}{'    ' if is_last_g else '│'}{r}")
-
-            print(f"{tr}{g_pref}{r}"
-                  f"{self._render_grupo(grupo, g_abbrevs.get(grupo), longitud=3)}")
-
-            evs       = self.storage.get_eventos(grupo)
-            e_abbrevs = self.calc_abreviaturas(evs, longitud=2)
-
-            for ei, stem in enumerate(evs):
-                is_last_e = ei == len(evs) - 1
-                pad       = "    " if is_last_g else "│   "
-                e_pref    = "└── " if is_last_e else "├── "
-
-                ev_path = self.storage.get_evento_path(grupo, stem)
-                origin  = self.storage.links.origin(grupo, stem)
-
-                # extensión si no es .md (o si es .gpg)
-                ext_str = ""
-                if ev_path:
-                    real_ext = ev_path.suffix.lower()
-                    if real_ext == ".gpg":
-                        ext_str = f"{self.c.get('date')}.gpg{r}"
-                    elif real_ext != ".md":
-                        ext_str = f"{self.c.get('date')}{real_ext}{r}"
-
-                # indicadores compactos (g i) antes del origen
-                badges = ""
-                if self.storage.gpg.is_protected(grupo, stem):
-                    badges += f" {self.c.get('warn')}g{r}"
-                if self.storage.info.has(grupo, stem):
-                    badges += f" {self.c.get('date')}i{r}"
-
-                # origen
-                origen_str = ""
-                if origin:
-                    es_copia   = self.storage.links.is_copy(grupo, stem)
-                    origen_fmt = self._fmt_origin(origin)
-                    disponible = Path(origin).is_file()
-                    sep = f"  {self.c.get('tree')}·{r}  "
-                    if not disponible:
-                        origen_str = f"{sep}{self.c.get('minus')}✗{r} {self.c.get('date')}{origen_fmt}{r}"
-                    elif es_copia:
-                        origen_str = f"{sep}{self.c.get('date')}c → {origen_fmt}{r}"
-                    else:
-                        origen_str = f"{sep}{self.c.get('date')}→ {origen_fmt}{r}"
-
-                fecha_str = ""
-                if show_dates:
-                    mt = self.storage.mtime(ev_path)
-                    if mt:
-                        fecha_str = f"  {self.c.get('date')}{mt.strftime('%Y-%m-%d %H:%M')}{r}"
-
-                print(f"{tr}{pad}{e_pref}{r}"
-                      f"{self._render_label(stem, e_abbrevs.get(stem), longitud=2)}"
-                      f"{ext_str}{badges}{origen_str}{fecha_str}")
-
-    def pedir_grupo(self, label="Grupo"):
-        grupos = self.storage.get_grupos()
-        self.print_arbol()
-        while True:
-            res = self.leer(f"{label}: ")
-            if not res: return ""
-            g_abbrevs = self.calc_abreviaturas(grupos, longitud=3)
-            for g in grupos:
-                if (g_abbrevs.get(g) == self.storage.normalize(res) or
-                        self.storage.normalize(g) == self.storage.normalize(res)):
-                    return g
-            return self.storage.titulo(res)
-
-    def pedir_evento(self, grupo, label="Evento"):
-        evs = self.storage.get_eventos(grupo)
-        if evs:
-            e_abbrevs = self.calc_abreviaturas(evs, longitud=2)
-            print(f"\n  Eventos en {grupo}:")
-            for e in evs:
-                print(f"    {self._render_label(e, e_abbrevs.get(e), longitud=2)}")
-            print()
-        while True:
-            res = self.leer(f"{label}: ")
-            if not res: return ""
-            e_abbrevs = self.calc_abreviaturas(evs, longitud=2)
-            for e in evs:
-                if (e_abbrevs.get(e) == res.lower() or
-                        self.storage.normalize(e) == res.lower()):
-                    return e
-            return res.lower()
-
-
-# ===== NÚCLEO =====
-class ByteApp:
-    def __init__(self, base_path, editor_name, links_path=None, info_path=None):
-        self.storage = ByteStorage(base_path, links_path=links_path, info_path=info_path)
-        self.c       = ByteColor()
-        self.ui      = ByteInterface(self.storage, self.c)
-        self.editor  = editor_name
-        self.gpg_key = GPG_KEY
-
-    # ----- resolución -----
-
-    def find_grupo(self, token):
-        token_p   = self.storage.normalize(token)
-        grupos    = self.storage.get_grupos()
-        g_abbrevs = self.ui.calc_abreviaturas(grupos, longitud=3)
-        for g in grupos:
-            if g_abbrevs.get(g) == token_p or self.storage.normalize(g) == token_p:
-                return g
-        return None
-
-    def parse_arg(self, arg):
-        if not arg: return None, None
-        m = re.match(r"^([^/]+)/(.+)$", arg)
-        if m:
-            g_raw, ev_raw = m.group(1), m.group(2)
-            grupo = self.find_grupo(g_raw) or self.storage.titulo(g_raw)
-            evs   = self.storage.get_eventos(grupo)
-            e_abb = self.ui.calc_abreviaturas(evs, longitud=2)
-            ev_stem = Path(ev_raw).stem if Path(ev_raw).suffix.lower() in TEXTO_PLANO else ev_raw
-            for e in evs:
-                if e_abb.get(e) == ev_stem.lower() or self.storage.normalize(e) == ev_stem.lower():
-                    return grupo, e
-            return grupo, ev_stem.lower()
-        m = re.match(r"^([^/]+)/$", arg)
-        if m:
-            return self.find_grupo(m.group(1)) or self.storage.titulo(m.group(1)), None
-        return None, arg
-
-    def resolver_arg(self, arg):
-        g, e = self.parse_arg(arg)
-        if g and e: return g, e
-        token = e or g
-        if not token: return None, None
-        token_path = Path(token)
-        token_stem = token_path.stem if token_path.suffix.lower() in TEXTO_PLANO else token
-        grupos    = self.storage.get_grupos()
-        g_abbrevs = self.ui.calc_abreviaturas(grupos, longitud=3)
-        for g_item in grupos:
-            evs   = self.storage.get_eventos(g_item)
-            e_abb = self.ui.calc_abreviaturas(evs, longitud=2)
-            for e_item in evs:
-                if (e_abb.get(e_item) == token_stem.lower() or
-                        self.storage.normalize(e_item) == self.storage.normalize(token_stem)):
-                    return g_item, e_item
-        for g_item in grupos:
-            if (g_abbrevs.get(g_item) == token_stem.lower() or
-                    self.storage.normalize(g_item) == self.storage.normalize(token_stem)):
-                return g_item, None
-        return None, token_stem
-
-    # ----- GPG helpers -----
-
-    def _gpg_encrypt(self, path: Path, key_id: str) -> Path:
-        """Cifra path → path.gpg, borra el original. Devuelve path.gpg."""
-        out = Path(str(path) + ".gpg")
-        r = subprocess.run(
-            ["gpg", "--yes", "--batch", "--trust-model", "always", "-r", key_id, "-o", str(out), "-e", str(path)],
-            capture_output=True)
-        if r.returncode != 0:
-            raise RuntimeError(r.stderr.decode())
-        path.unlink()
-        return out
+    def _gpg_encrypt(self, plain_path: Path, key_id: str, output_path: Path) -> None:
+        out = output_path if output_path.suffix == ".gpg" else output_path.with_suffix(output_path.suffix + ".gpg")
+        res = subprocess.run(["gpg", "--yes", "--batch", "--trust-model", "always",
+                              "-r", key_id, "-o", str(out), "-e", str(plain_path)], capture_output=True)
+        if res.returncode != 0:
+            raise RuntimeError(res.stderr.decode())
+        if out != output_path:
+            out.rename(output_path)
 
     def _gpg_decrypt_to_tmp(self, path: Path) -> Path:
-        """Descifra path.gpg a un archivo temporal. Devuelve el Path temporal."""
-        # Recuperar extensión original: stem.md.gpg → stem.md
         inner_ext = Path(path.stem).suffix or ".md"
         tmp = tempfile.NamedTemporaryFile(suffix=inner_ext, delete=False)
         tmp.close()
         tmp_path = Path(tmp.name)
-        r = subprocess.run(
-            ["gpg", "--yes", "--batch", "-o", str(tmp_path), "-d", str(path)],
-            capture_output=True)
-        if r.returncode != 0:
-            tmp_path.unlink(missing_ok=True)
-            raise RuntimeError(r.stderr.decode())
+        res = subprocess.run(["gpg", "--yes", "--batch", "-o", str(tmp_path), "-d", str(path)], capture_output=True)
+        if res.returncode != 0:
+            tmp_path.unlink()
+            raise RuntimeError(res.stderr.decode())
         return tmp_path
 
-    # ----- comandos -----
+# ============================================================================
+# INTERFAZ DE USUARIO
+# ============================================================================
 
-    def cmd_open(self, args):
-        """Abre/crea evento. Con texto extra → append al final."""
+class ByteInterface:
+    def __init__(self, storage: ByteStorage):
+        self.storage = storage
+
+    def leer(self, prompt: str) -> str:
+        try:
+            return input(prompt).strip()
+        except (KeyboardInterrupt, EOFError):
+            print(f"\n  {C('tree')}(Interrumpido){C('rst')}")
+            sys.exit(0)
+
+    def calc_abreviaturas(self, lista: List[str], long: int) -> Dict[str, str]:
+        abbr = {}
+        usados: Set[str] = set()
+        for item in lista:
+            for i in range(len(item) - long + 1):
+                sub = item[i:i+long]
+                if sub not in usados:
+                    abbr[item] = sub
+                    usados.add(sub)
+                    break
+            else:
+                for i in range(len(item) - long + 1):
+                    sub = item[i:i+long]
+                    abbr[item] = sub
+                    break
+        return abbr
+
+    def render_ruta(self, grupo: str, stem: str) -> str:
+        grupos = self.storage.get_grupos()
+        g_abbr = self.calc_abreviaturas(grupos, 3)
+        g_render = _resaltar(grupo, g_abbr.get(grupo), 3, C("group"), C("bold"))
+        evs = self.storage.get_eventos(grupo)
+        if stem not in evs:
+            evs.append(stem)
+        e_abbr = self.calc_abreviaturas(evs, 2)
+        e_render = _resaltar(stem, e_abbr.get(stem), 2, C("event"), C("bold"))
+        return f"{g_render}{C('tree')}/{C('rst')}{e_render}"
+
+    def _fmt_origin(self, path_str: str) -> str:
+        p = Path(path_str)
+        parts = p.parts
+        if len(parts) >= 2:
+            return f"…/{parts[-2]}/{parts[-1]}"
+        return path_str
+
+    def print_arbol(self, grupos_filter: Optional[List[str]] = None, show_dates: bool = False) -> None:
+        grupos = grupos_filter if grupos_filter is not None else self.storage.get_grupos()
+        if not grupos:
+            print("  (vacío)")
+            return
+
+        tr = C("tree")
+        r = C("rst")
+        d = C("date")
+        w = C("warn")
+        max_name_len = 28
+
+        g_abbr = self.calc_abreviaturas(grupos, 3)
+
+        for gi, grupo in enumerate(grupos):
+            evs = self.storage.get_eventos(grupo)
+            ev_count = len(evs)
+            if gi > 0:
+                print()
+            grupo_render = _resaltar(grupo, g_abbr.get(grupo), 3, C("group"), C("bold"))
+            print(f"{tr}{grupo_render} {d}({ev_count}){r}")
+
+            if not evs:
+                continue
+
+            e_abbr = self.calc_abreviaturas(evs, 2)
+            for stem in evs:
+                ev_path = self.storage.get_evento_path(grupo, stem)
+
+                ext_str = ""
+                display_stem = stem
+                if ev_path:
+                    real_ext = ev_path.suffix.lower()
+                    if real_ext == ".gpg":
+                        ext_str = ""
+                    elif real_ext != ".md":
+                        ext_str = f"{d}{real_ext}{r}"
+                        display_stem = stem + real_ext
+
+                event_render = _resaltar(stem, e_abbr.get(stem), 2, C("event"), C("bold"))
+
+                badges = ""
+                if self.storage.gpg.is_protected(grupo, stem):
+                    badges += f" {w}g{r}"
+                if self.storage.info.has(grupo, stem):
+                    badges += f" {w}i{r}"
+
+                origins = self.storage.links.get_origins(grupo, stem)
+                origins_str = ""
+                if origins:
+                    parts = []
+                    for o in origins:
+                        path = o["path"]
+                        es_copia = o["copy"]
+                        origen_fmt = self._fmt_origin(path)
+                        disponible = Path(path).is_file()
+                        if not disponible:
+                            parts.append(f"{C('minus')}✗{r} {d}{origen_fmt}{r}")
+                        elif es_copia:
+                            parts.append(f"{d}c → {origen_fmt}{r}")
+                        else:
+                            parts.append(f"{d}→ {origen_fmt}{r}")
+                    origins_str = f" {d}·{r} " + f"{d}, {r}".join(parts)
+
+                fecha_str = ""
+                if show_dates and ev_path:
+                    mt = self.storage.mtime(ev_path)
+                    if mt:
+                        fecha_str = f" {d}{mt.strftime('%Y-%m-%d %H:%M')}{r}"
+
+                padding = max(0, max_name_len - len(display_stem))
+                line = f"  {event_render}{ext_str}{' ' * padding}{badges}{origins_str}{fecha_str}"
+                print(line)
+
+        print()
+
+    def pedir_grupo(self, label: str = "Grupo") -> str:
+        grupos = self.storage.get_grupos()
+        self.print_arbol()
+        while True:
+            res = self.leer(f"{label}: ")
+            if not res:
+                return ""
+            if res in grupos:
+                return res
+            g_abbr = self.calc_abreviaturas(grupos, 3)
+            for g, ab in g_abbr.items():
+                if ab == res:
+                    return g
+            res_norm = self.storage.normalize(res)
+            for g in grupos:
+                if self.storage.normalize(g) == res_norm:
+                    return g
+            return self.storage.titulo(res)
+
+    def pedir_evento(self, grupo: str, label: str = "Evento") -> str:
+        evs = self.storage.get_eventos(grupo)
+        if evs:
+            e_abbr = self.calc_abreviaturas(evs, 2)
+            print(f"\n  Eventos en {grupo}:")
+            for e in evs:
+                render = _resaltar(e, e_abbr.get(e), 2, C("event"), C("bold"))
+                print(f"    {render}")
+            print()
+        while True:
+            res = self.leer(f"{label}: ")
+            if not res:
+                return ""
+            if res in evs:
+                return res
+            e_abbr = self.calc_abreviaturas(evs, 2)
+            for e, ab in e_abbr.items():
+                if ab == res:
+                    return e
+            res_norm = self.storage.normalize(res)
+            for e in evs:
+                if self.storage.normalize(e) == res_norm:
+                    return e
+            return res
+
+# ============================================================================
+# APLICACIÓN PRINCIPAL
+# ============================================================================
+
+class ByteApp:
+    def __init__(self, config: Config):
+        self.config = config
+        self.storage = ByteStorage(config.base)
+        self.ui = ByteInterface(self.storage)
+
+    # --- Resolución de argumentos (case‑sensitive) ---
+    def find_grupo(self, token: str) -> Optional[str]:
+        grupos = self.storage.get_grupos()
+        if token in grupos:
+            return token
+        g_abbr = self.ui.calc_abreviaturas(grupos, 3)
+        for g, ab in g_abbr.items():
+            if ab == token:
+                return g
+        token_norm = self.storage.normalize(token)
+        for g in grupos:
+            if self.storage.normalize(g) == token_norm:
+                return g
+        return None
+
+    def parse_arg(self, arg: str) -> Tuple[Optional[str], Optional[str]]:
+        if not arg:
+            return None, None
+        m = re.match(r"^([^/]+)/(.+)$", arg)
+        if m:
+            g_raw, ev_raw = m.group(1), m.group(2)
+            grupo = self.find_grupo(g_raw)
+            if grupo is None:
+                grupo = self.storage.titulo(g_raw)
+            ev_stem = Path(ev_raw).stem if Path(ev_raw).suffix in {".md", ".txt", ".py", ".sh"} else ev_raw
+            return grupo, ev_stem
+        m = re.match(r"^([^/]+)/$", arg)
+        if m:
+            grupo = self.find_grupo(m.group(1))
+            if grupo is None:
+                grupo = self.storage.titulo(m.group(1))
+            return grupo, None
+        return None, arg
+
+    def resolver_arg(self, arg: str) -> Tuple[Optional[str], Optional[str]]:
+        g, e = self.parse_arg(arg)
+        if g and e:
+            return g, e
+        token = e or g
+        if not token:
+            return None, None
+        for grupo in self.storage.get_grupos():
+            evs = self.storage.get_eventos(grupo)
+            if token in evs:
+                return grupo, token
+            e_abbr = self.ui.calc_abreviaturas(evs, 2)
+            for ev, ab in e_abbr.items():
+                if ab == token:
+                    return grupo, ev
+            token_norm = self.storage.normalize(token)
+            for ev in evs:
+                if self.storage.normalize(ev) == token_norm:
+                    return grupo, ev
+        grupo = self.find_grupo(token)
+        if grupo:
+            return grupo, None
+        return None, token
+
+    # --- Comandos ---
+    def cmd_open(self, args: List[str]) -> None:
+        if not sys.stdout.isatty() and len(args) == 1:
+            token = args[0]
+            grupo, stem = self.resolver_arg(token)
+            if not grupo:
+                stem = token
+                grupo = self.ui.pedir_grupo(f"Grupo para '{stem}'")
+                if not grupo:
+                    return
+            if not stem:
+                stem = self.ui.pedir_evento(grupo, "Evento")
+                if not stem:
+                    return
+            contenido = self.storage.leer_evento(grupo, stem)
+            if contenido is None:
+                print(f"Evento no existe: {grupo}/{stem}", file=sys.stderr)
+                sys.exit(1)
+            sys.stdout.write(contenido)
+            return
+
         if not args:
             grupo = self.ui.pedir_grupo()
-            if not grupo: return
-            stem  = self.ui.pedir_evento(grupo)
-            if not stem: return
+            if not grupo:
+                return
+            stem = self.ui.pedir_evento(grupo)
+            if not stem:
+                return
             texto = None
         else:
             token = args[0]
             texto = " ".join(args[1:]) if len(args) > 1 else None
             grupo, stem = self.resolver_arg(token)
             if not grupo:
-                stem  = Path(token).stem if Path(token).suffix.lower() in TEXTO_PLANO else token.lower()
+                stem = Path(token).stem if Path(token).suffix in {".md", ".txt", ".py", ".sh"} else token
                 grupo = self.ui.pedir_grupo(f"Grupo para '{stem}'")
-                if not grupo: return
+                if not grupo:
+                    return
             if not stem:
                 stem = self.ui.pedir_evento(grupo, "Evento")
-                if not stem: return
+                if not stem:
+                    return
 
         ev_path = self.storage.get_evento_path(grupo, stem)
         if ev_path is None:
@@ -628,298 +701,323 @@ class ByteApp:
 
         ruta_fmt = self.ui.render_ruta(grupo, stem)
 
-        # modo append
         if texto is not None:
             es_nuevo = not ev_path.is_file()
-            ev_path.parent.mkdir(parents=True, exist_ok=True)
-            target = ev_path
-            # si está cifrado, descifrar primero
-            if ev_path.suffix.lower() == ".gpg":
-                tmp = self._gpg_decrypt_to_tmp(ev_path)
-                with open(tmp, "a", encoding="utf-8") as f:
-                    f.write(texto + "\n")
-                key_id = self.storage.gpg.key_id(grupo, stem)
-                self._gpg_encrypt(tmp, key_id)
-                ev_path.unlink(missing_ok=True)
-                # re-cifrar
-                inner = Path(str(tmp).rstrip(".gpg"))
-                shutil.copy2(tmp, inner); tmp.unlink(missing_ok=True)
-                self._gpg_encrypt(inner, key_id)
-            else:
-                with open(target, "a", encoding="utf-8") as f:
-                    f.write(texto + "\n")
+            contenido_actual = self.storage.leer_evento(grupo, stem) or ""
+            nuevo = contenido_actual + texto + "\n"
+            key_id = self.storage.gpg.key_id(grupo, stem) if self.storage.gpg.is_protected(grupo, stem) else None
+            self.storage.escribir_evento(grupo, stem, nuevo, key_id=key_id, cifrar=bool(key_id))
             accion = "+" if es_nuevo else "~"
-            print(f"{self.c.get('plus')}{accion} {ruta_fmt} {self.c.get('tree')}│{self.c.get('rst')} {texto}")
+            print(f"{C('plus')}{accion} {ruta_fmt} {C('tree')}│{C('rst')} {texto}")
             return
 
-        # modo editor
         es_nuevo = not ev_path.is_file()
-
-        # si está cifrado
         if ev_path.suffix.lower() == ".gpg":
             try:
-                tmp = self._gpg_decrypt_to_tmp(ev_path)
+                tmp = self.storage._gpg_decrypt_to_tmp(ev_path)
             except RuntimeError as e:
-                return print(f"GPG error: {e}")
+                print(f"GPG error: {e}")
+                return
             mtime_antes = tmp.stat().st_mtime
-            os.system(f'{self.editor} "{tmp}"')
+            os.system(f'{self.config.editor} "{tmp}"')
             if tmp.stat().st_mtime != mtime_antes:
                 key_id = self.storage.gpg.key_id(grupo, stem)
-                ev_path.unlink()
-                inner_ext = Path(ev_path.stem).suffix or ".md"
-                inner = ev_path.parent / (stem + inner_ext)
-                shutil.move(str(tmp), str(inner))
-                self._gpg_encrypt(inner, key_id)
-                print(f"{self.c.get('count')}~ {ruta_fmt}{self.c.get('rst')} (cifrado)")
+                contenido = tmp.read_text(encoding="utf-8")
+                try:
+                    self.storage.escribir_evento(grupo, stem, contenido, key_id=key_id, cifrar=True)
+                    print(f"{C('count')}~ {ruta_fmt}{C('rst')} (cifrado)")
+                except Exception as e:
+                    print(f"Error al guardar: {e}")
             else:
-                tmp.unlink(missing_ok=True)
-                print(f"{self.c.get('date')}  (sin cambios){self.c.get('rst')}")
+                tmp.unlink()
+                print(f"{C('date')}  (sin cambios){C('rst')}")
             return
 
         ev_path.parent.mkdir(parents=True, exist_ok=True)
         ev_path.touch()
-        os.system(f'{self.editor} "{ev_path}"')
-
+        os.system(f'{self.config.editor} "{ev_path}"')
         if es_nuevo and ev_path.stat().st_size == 0:
             ev_path.unlink()
-            print(f"{self.c.get('minus')}(Archivo vacío descartado){self.c.get('rst')}")
+            print(f"{C('minus')}(Archivo vacío descartado){C('rst')}")
         else:
-            accion = f"{self.c.get('plus')}+" if es_nuevo else f"{self.c.get('count')}~"
-            print(f"{accion} {ruta_fmt}{self.c.get('rst')}")
+            accion = f"{C('plus')}+" if es_nuevo else f"{C('count')}~"
+            print(f"{accion} {ruta_fmt}{C('rst')}")
 
-    def cmd_link(self, args):
-        """byte --link archivo [nombre]
-        Un argumento: usa el mismo nombre del archivo.
-        Dos argumentos: usa el segundo como nombre del evento.
-        """
+    def cmd_link(self, args: List[str]) -> None:
         if not args:
             archivo = self.ui.leer("Archivo a enlazar: ")
-            if not archivo: return
-            grupo_hint, stem_override = None, ""
+            if not archivo:
+                return
+            grupo_hint = None
+            stem_override = None
         elif len(args) == 1:
             archivo = args[0]
-            grupo_hint, stem_override = None, ""
+            grupo_hint = None
+            stem_override = None
         else:
             archivo = args[0]
             segundo = args[1]
-            # Segundo arg puede ser Grupo/stem, Grupo/ o solo stem
             if "/" in segundo:
                 partes = segundo.split("/", 1)
-                grupo_hint    = self.find_grupo(partes[0]) or self.storage.titulo(partes[0])
-                stem_override = partes[1] if partes[1] else ""
+                grupo_hint = self.find_grupo(partes[0])
+                if grupo_hint is None:
+                    grupo_hint = self.storage.titulo(partes[0])
+                stem_override = partes[1] if partes[1] else None
             else:
-                grupo_hint    = None
+                grupo_hint = None
                 stem_override = segundo
 
         src = Path(archivo).expanduser().resolve()
-        if not src.is_file():
-            return print(f"No existe: {src}")
-
-        # Determinar stem y ext finales
-        if stem_override:
-            p_override = Path(stem_override)
-            if p_override.suffix.lower() in TEXTO_PLANO:
-                # "zshrc.md" → stem="zshrc", ext=".md"
-                stem = p_override.stem
-                ext  = p_override.suffix.lower()
-            else:
-                # override sin extensión reconocida → usarlo como stem, ext del origen
-                stem = stem_override
-                ext  = src.suffix.lower()
-        else:
-            stem = src.stem
-            ext  = src.suffix.lower()
-
-        if ext and ext not in TEXTO_PLANO:
-            print(f"{self.c.get('warn')}Advertencia: '{ext}' no es texto plano. "
-                  f"Se enlazará igualmente.{self.c.get('rst')}")
+        src_exists = src.is_file()
+        src_parent = src.parent
 
         if grupo_hint:
             grupo = grupo_hint
-            self.ui.print_arbol()
-            print(f"  → Grupo: {grupo}")
         else:
-            grupo = self.ui.pedir_grupo(f"Grupo para '{stem}{ext}'")
-        if not grupo: return
+            self.ui.print_arbol()
+            grupo = self.ui.pedir_grupo("Grupo para el evento")
+            if not grupo:
+                return
 
-        dest = self.storage.base / self.storage.titulo(grupo) / f"{stem}{ext}"
+        if stem_override:
+            p_override = Path(stem_override)
+            if p_override.suffix in {".md", ".txt", ".py", ".sh"}:
+                stem = p_override.stem
+                ext = p_override.suffix
+            else:
+                stem = stem_override
+                ext = ".md"
+        else:
+            stem = src.stem
+            ext = src.suffix if src.suffix else ".md"
 
-        if dest.exists():
-            if dest.stat().st_ino == src.stat().st_ino:
-                return print(f"{self.c.get('date')}(Hardlink ya existe){self.c.get('rst')}")
-            return print(f"Ya existe {grupo}/{stem}{ext} con distinto contenido. Abortando.")
+        ev_path = self.storage.get_evento_path(grupo, stem)
+        ev_exists = ev_path is not None and ev_path.is_file()
+        if not ev_exists:
+            ev_path = self.storage.evento_path(grupo, stem, ext=ext)
 
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            os.link(src, dest)
-            metodo, es_copia = "hardlink", False
-        except OSError as e:
-            print(f"{self.c.get('date')}  hardlink no posible ({e.strerror}), copiando...{self.c.get('rst')}")
-            shutil.copy2(src, dest)
-            metodo, es_copia = "copia", True
+        # Caso 1: origen no existe, evento sí
+        if not src_exists and ev_exists:
+            print(f"{C('date')}  El archivo externo no existe, se creará a partir del vault.{C('rst')}")
+            if self.ui.leer(f"  Crear {src} desde {grupo}/{stem}? (s/{C('date')}N{C('rst')}): ").lower() != 's':
+                return
+            src_parent.mkdir(parents=True, exist_ok=True)
+            contenido = self.storage.leer_evento(grupo, stem)
+            if contenido is None:
+                print("  Error al leer el evento")
+                return
+            src.write_text(contenido, encoding="utf-8")
+            self.storage.links.add_origin(grupo, stem, src, es_copia=True)
+            print(f"{C('plus')}+ {self.ui.render_ruta(grupo, stem)}{C('rst')}"
+                  f"  {C('link')}→ {self.ui._fmt_origin(str(src))} (copia desde vault){C('rst')}")
+            return
 
-        self.storage.links.register(grupo, stem, src, es_copia=es_copia)
-        origen_fmt = self.ui._fmt_origin(str(src))
-        ruta_fmt   = self.ui.render_ruta(grupo, stem)
-        print(f"{self.c.get('plus')}+ {ruta_fmt}{self.c.get('rst')}"
-              f"  {self.c.get('link')}→ {origen_fmt}  ({metodo}){self.c.get('rst')}")
+        # Caso 2: origen existe, evento no
+        if src_exists and not ev_exists:
+            print(f"{C('date')}  El evento {grupo}/{stem} no existe, se creará desde el archivo externo.{C('rst')}")
+            if self.ui.leer(f"  Crear {grupo}/{stem} desde {src}? (s/{C('date')}N{C('rst')}): ").lower() != 's':
+                return
+            ev_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.link(src, ev_path)
+                metodo = "hardlink"
+                es_copia = False
+            except OSError:
+                shutil.copy2(src, ev_path)
+                metodo = "copia"
+                es_copia = True
+            self.storage.links.add_origin(grupo, stem, src, es_copia=es_copia)
+            ruta_fmt = self.ui.render_ruta(grupo, stem)
+            print(f"{C('plus')}+ {ruta_fmt}{C('rst')}"
+                  f"  {C('link')}→ {self.ui._fmt_origin(str(src))}  ({metodo}){C('rst')}")
+            return
 
-    def cmd_unlink(self, args):
-        """Elimina el registro del enlace/copia. Ambos archivos quedan intactos."""
+        # Caso 3: ambos existen
+        if src_exists and ev_exists:
+            origins = self.storage.links.get_origins(grupo, stem)
+            if any(o["path"] == str(src) for o in origins):
+                print(f"{C('date')}  {self.ui.render_ruta(grupo, stem)} ya tiene este origen: {src}{C('rst')}")
+                return
+
+            print(f"{C('warn')}  Conflicto: ambos archivos existen y no están vinculados.{C('rst')}")
+            print(f"    Vault: {ev_path}")
+            print(f"    Externo: {src}")
+            op = self.ui.leer("  ¿[v]ault → origen, [o]rigen → vault, [a]ñadir como otro origen, [n]ada? (v/o/a/n): ").lower()
+            if op == 'v':
+                if self.ui.leer(f"  ¿Sobrescribir {src} con el contenido del vault? (s/{C('date')}N{C('rst')}): ").lower() != 's':
+                    return
+                contenido = self.storage.leer_evento(grupo, stem)
+                if contenido is not None:
+                    src.write_text(contenido, encoding="utf-8")
+                    self.storage.links.add_origin(grupo, stem, src, es_copia=True)
+                    print(f"{C('plus')}✓ {self.ui.render_ruta(grupo, stem)} → {src} (actualizado){C('rst')}")
+                else:
+                    print("  Error al leer el vault")
+            elif op == 'o':
+                if self.ui.leer(f"  ¿Sobrescribir {ev_path} con el contenido de {src}? (s/{C('date')}N{C('rst')}): ").lower() != 's':
+                    return
+                contenido = src.read_text(encoding="utf-8")
+                key_id = self.storage.gpg.key_id(grupo, stem) if self.storage.gpg.is_protected(grupo, stem) else None
+                self.storage.escribir_evento(grupo, stem, contenido, key_id=key_id, cifrar=bool(key_id))
+                self.storage.links.add_origin(grupo, stem, src, es_copia=False)
+                print(f"{C('plus')}✓ {self.ui.render_ruta(grupo, stem)} actualizado desde {src}{C('rst')}")
+            elif op == 'a':
+                self.storage.links.add_origin(grupo, stem, src, es_copia=True)
+                print(f"{C('plus')}+ {self.ui.render_ruta(grupo, stem)}{C('rst')}"
+                      f"  {C('link')}→ {self.ui._fmt_origin(str(src))} (nuevo origen){C('rst')}")
+            else:
+                print(f"{C('date')}  Cancelado.{C('rst')}")
+            return
+
+        print(f"{C('minus')}  Ni el archivo externo ni el evento existen. Nada que hacer.{C('rst')}")
+
+    def cmd_unlink(self, args: List[str]) -> None:
         if not args:
-            # mostrar solo eventos que tienen enlace registrado
             enlazados = []
             for g in self.storage.get_grupos():
                 for stem in self.storage.get_eventos(g):
-                    if self.storage.links.is_registered(g, stem):
-                        enlazados.append((g, stem))
+                    origins = self.storage.links.get_origins(g, stem)
+                    if origins:
+                        enlazados.append((g, stem, origins))
             if not enlazados:
-                print(f"{self.c.get('date')}  No hay enlaces registrados.{self.c.get('rst')}")
+                print(f"{C('date')}  No hay enlaces registrados.{C('rst')}")
                 return
-            for g, stem in enlazados:
-                ruta_fmt   = self.ui.render_ruta(g, stem)
-                origen_fmt = self.ui._fmt_origin(self.storage.links.origin(g, stem) or "")
-                es_copia   = self.storage.links.is_copy(g, stem)
-                marca      = "c →" if es_copia else "→"
-                print(f"  {ruta_fmt}  {self.c.get('link')}{marca} {origen_fmt}{self.c.get('rst')}")
-            entrada = self.ui.leer("Evento: ")
-            if not entrada: return
+            for g, stem, origins in enlazados:
+                ruta_fmt = self.ui.render_ruta(g, stem)
+                print(f"  {ruta_fmt}")
+                for idx, o in enumerate(origins):
+                    marca = "c →" if o["copy"] else "→"
+                    print(f"      [{idx+1}] {marca} {self.ui._fmt_origin(o['path'])}")
+            entrada = self.ui.leer("Evento o número de origen a desenlazar (ej. '2' o 'Grupo/evento'): ")
+            if not entrada:
+                return
         else:
             entrada = args[0]
 
+        if entrada.isdigit():
+            print("  Para eliminar un origen específico, usa el nombre completo del evento.")
+            return
+
         grupo, stem = self.resolver_arg(entrada)
         if not grupo or not stem:
-            return print(f"No encontrado: '{entrada}'")
+            print(f"No encontrado: '{entrada}'")
+            return
 
-        if not self.storage.links.is_registered(grupo, stem):
-            ruta_fmt = self.ui.render_ruta(grupo, stem)
-            return print(f"  {ruta_fmt}  {self.c.get('date')}(sin enlace registrado){self.c.get('rst')}")
+        origins = self.storage.links.get_origins(grupo, stem)
+        if not origins:
+            print(f"  {self.ui.render_ruta(grupo, stem)}  {C('date')}(sin enlaces registrados){C('rst')}")
+            return
 
-        origen_fmt = self.ui._fmt_origin(self.storage.links.origin(grupo, stem) or "")
-        ruta_fmt   = self.ui.render_ruta(grupo, stem)
-        self.storage.links.remove(grupo, stem)
-        print(f"{self.c.get('minus')}  {ruta_fmt}  {self.c.get('date')}desenlazado "
-              f"(archivo intacto){self.c.get('rst')}  {self.c.get('link')}{origen_fmt}{self.c.get('rst')}")
+        if len(origins) == 1:
+            origen = origins[0]["path"]
+            if self.ui.leer(f"  ¿Desenlazar {self.ui.render_ruta(grupo, stem)} de {origen}? (s/{C('date')}N{C('rst')}): ").lower() == 's':
+                self.storage.links.remove_origin(grupo, stem, Path(origen))
+                print(f"{C('minus')}  {self.ui.render_ruta(grupo, stem)}  {C('date')}desenlazado{C('rst')}")
+        else:
+            print(f"  Múltiples orígenes para {self.ui.render_ruta(grupo, stem)}:")
+            for idx, o in enumerate(origins):
+                print(f"    [{idx+1}] {'c →' if o['copy'] else '→'} {self.ui._fmt_origin(o['path'])}")
+            op = self.ui.leer("  Número a desenlazar, 't' para todos, 'c' para cancelar: ")
+            if op == 'c':
+                return
+            if op == 't':
+                if self.ui.leer(f"  ¿Eliminar todos los enlaces de {grupo}/{stem}? (s/{C('date')}N{C('rst')}): ").lower() == 's':
+                    self.storage.links.remove_all_origins(grupo, stem)
+                    print(f"{C('minus')}  {self.ui.render_ruta(grupo, stem)}  {C('date')}todos los enlaces eliminados{C('rst')}")
+                return
+            if op.isdigit():
+                idx = int(op) - 1
+                if 0 <= idx < len(origins):
+                    origen = origins[idx]["path"]
+                    if self.ui.leer(f"  ¿Desenlazar {origen}? (s/{C('date')}N{C('rst')}): ").lower() == 's':
+                        self.storage.links.remove_origin(grupo, stem, Path(origen))
+                        print(f"{C('minus')}  {self.ui.render_ruta(grupo, stem)}  {C('date')}desenlazado{C('rst')}")
+                else:
+                    print("  Número inválido.")
 
-    def cmd_del(self, args):
+    def cmd_del(self, args: List[str]) -> None:
         entrada = args[0] if args else self.ui.leer("Borrar Grupo/ o evento: ")
-        if not entrada: return print("Cancelado.")
-
+        if not entrada:
+            print("Cancelado.")
+            return
         grupo, stem = self.resolver_arg(entrada)
 
         if grupo and not stem:
             gp = self.storage.grupo_path(grupo)
-            if not gp.is_dir(): return print(f"No existe el grupo '{grupo}'")
+            if not gp.is_dir():
+                print(f"No existe el grupo '{grupo}'")
+                return
             self.ui.print_arbol([grupo])
-            if self.ui.leer(f"Enviar al trash '{grupo}/'? (s/n): ") == "s":
+            if self.ui.leer(f"Enviar al trash '{grupo}/'? (s/{C('date')}N{C('rst')}): ") == "s":
                 for ev in self.storage.get_eventos(grupo):
                     p = self.storage.get_evento_path(grupo, ev)
                     if p:
-                        self.storage.links.remove(grupo, ev)
+                        self.storage.links.remove_all_origins(grupo, ev)
                         self.storage.info.remove(grupo, ev)
                         self.storage.gpg.unmark(grupo, ev)
                 self.storage.trash(gp)
                 print(f"Enviado al trash: {grupo}/")
         else:
             if not grupo or not stem:
-                return print(f"No encontrado: '{entrada}'")
+                print(f"No encontrado: '{entrada}'")
+                return
             ev_path = self.storage.get_evento_path(grupo, stem)
             if not ev_path or not ev_path.is_file():
-                return print(f"No existe {grupo}/{stem}")
+                print(f"No existe {grupo}/{stem}")
+                return
             ruta_fmt = self.ui.render_ruta(grupo, stem)
-            if self.ui.leer(f"Enviar al trash {grupo}/{ev_path.name}? (s/n): ") == "s":
-                self.storage.links.remove(grupo, stem)
+            if self.ui.leer(f"Enviar al trash {grupo}/{ev_path.name}? (s/{C('date')}N{C('rst')}): ") == "s":
+                self.storage.links.remove_all_origins(grupo, stem)
                 self.storage.info.remove(grupo, stem)
                 self.storage.gpg.unmark(grupo, stem)
                 self.storage.trash(ev_path)
-                print(f"{self.c.get('minus')}- {ruta_fmt}{self.c.get('rst')}")
-
+                print(f"{C('minus')}- {ruta_fmt}{C('rst')}")
         self.storage.limpiar_vacios()
 
-    def cmd_mv(self, args):
-        if not args:
-            self.ui.print_arbol()
-            opcion = self.ui.leer("¿[m]over o [f]usionar? (m/f): ").lower()
-            if opcion == "f":
-                g_dest = self.ui.pedir_grupo("Grupo destino")
-                e_dest = self.ui.pedir_evento(g_dest, "Evento destino")
-                g_src  = self.ui.pedir_grupo("Grupo fuente")
-                e_src  = self.ui.pedir_evento(g_src, "Evento fuente")
-                self._fusionar(g_dest, e_dest, g_src, e_src)
-            else:
-                g_src  = self.ui.pedir_grupo("Grupo origen")
-                e_src  = self.ui.pedir_evento(g_src, "Evento origen")
-                g_dest = self.ui.pedir_grupo("Grupo destino")
-                nuevo  = self.ui.leer(f"Nuevo nombre (Enter = '{e_src}'): ") or e_src
-                self._mover(g_src, e_src, g_dest, nuevo.lower())
+    def _renombrar(self, grupo: str, origen: str, destino: str) -> None:
+        p_src = self.storage.get_evento_path(grupo, origen)
+        if not p_src:
+            print(f"No existe: {grupo}/{origen}")
             return
-
-        if len(args) == 1:
-            return print("Uso: byte --mv [destino] [fuente]  |  byte --mv [origen] [Grupo/]")
-
-        a1, a2 = args[0], args[1]
-        if a2.endswith("/"):
-            g_src, e_src = self.resolver_arg(a1)
-            g_dest = self.find_grupo(a2.rstrip("/")) or self.storage.titulo(a2.rstrip("/"))
-            if not g_src or not e_src: return print(f"Origen no encontrado: '{a1}'")
-            self._mover(g_src, e_src, g_dest, e_src)
+        ext = p_src.suffix
+        p_dest = self.storage.evento_path(grupo, destino, ext=ext)
+        if p_dest.is_file():
+            print(f"Ya existe {grupo}/{destino}{ext}")
+            resp = self.ui.leer(f"¿Sobrescribir? (s/{C('date')}N{C('rst')}): ").lower()
+            if resp != 's':
+                return
+            self.storage.trash(p_dest)
+        elif p_dest.exists():
+            print(f"El destino {p_dest} existe y no es un archivo regular. No se puede renombrar.")
             return
-        if "/" in a2:
-            g_src, e_src   = self.resolver_arg(a1)
-            g_dest, e_dest = self.resolver_arg(a2)
-            if not g_src or not e_src: return print(f"Origen no encontrado: '{a1}'")
-            if not g_dest:
-                partes = a2.split("/")
-                g_dest, e_dest = self.storage.titulo(partes[0]), partes[1].lower()
-            if not e_dest: e_dest = e_src
-            p_dest = self.storage.get_evento_path(g_dest, e_dest)
-            if p_dest and p_dest.is_file():
-                self._fusionar(g_dest, e_dest, g_src, e_src)
-            else:
-                self._mover(g_src, e_src, g_dest, e_dest)
-            return
-        g_dest, e_dest = self.resolver_arg(a1)
-        g_src,  e_src  = self.resolver_arg(a2)
-        if not g_dest or not e_dest: return print(f"Destino no encontrado: '{a1}'")
-        if not g_src  or not e_src:  return print(f"Fuente no encontrado: '{a2}'")
-        self._fusionar(g_dest, e_dest, g_src, e_src)
+        shutil.move(p_src, p_dest)
+        self.storage.links.rename(grupo, origen, grupo, destino)
+        info_txt = self.storage.info.get(grupo, origen)
+        if info_txt:
+            self.storage.info.set(grupo, destino, info_txt)
+            self.storage.info.remove(grupo, origen)
+        if self.storage.gpg.is_protected(grupo, origen):
+            key_id = self.storage.gpg.key_id(grupo, origen)
+            self.storage.gpg.mark(grupo, destino, key_id)
+            self.storage.gpg.unmark(grupo, origen)
+        print(f"{C('plus')}✓ Renombrado: {grupo}/{origen} → {grupo}/{destino}{C('rst')}")
 
-    def _fusionar(self, g_dest, e_dest, g_src, e_src):
-        p_src  = self.storage.get_evento_path(g_src, e_src)
-        p_dest = self.storage.get_evento_path(g_dest, e_dest)
-        if not p_src or not p_src.is_file():
-            return print(f"No existe: {g_src}/{e_src}")
-        p_dest_real = p_dest if p_dest else self.storage.evento_path(g_dest, e_dest)
-        p_dest_real.parent.mkdir(parents=True, exist_ok=True)
-        contenido_src = p_src.read_text(encoding="utf-8")
-        if p_dest_real.is_file():
-            contenido_dest = p_dest_real.read_text(encoding="utf-8")
-            sep = "\n\n---\n\n" if contenido_dest.strip() else ""
-            p_dest_real.write_text(contenido_dest + sep + contenido_src, encoding="utf-8")
-        else:
-            p_dest_real.write_text(contenido_src, encoding="utf-8")
-        self.storage.links.remove(g_src, e_src)
-        self.storage.info.remove(g_src, e_src)
-        self.storage.gpg.unmark(g_src, e_src)
-        p_src.unlink()
-        self.storage.limpiar_vacios()
-        r_src  = self.ui.render_ruta(g_src, e_src)
-        r_dest = self.ui.render_ruta(g_dest, e_dest)
-        print(f"{self.c.get('plus')}✓ Fusionado: {r_src} ➔ {r_dest}{self.c.get('rst')}")
-
-    def _mover(self, g_src, e_src, g_dest, e_dest):
+    def _mover(self, g_src: str, e_src: str, g_dest: str, e_dest: str) -> None:
         p_src = self.storage.get_evento_path(g_src, e_src)
         if not p_src or not p_src.is_file():
-            return print(f"No existe: {g_src}/{e_src}")
+            print(f"No existe: {g_src}/{e_src}")
+            return
         p_dest = self.storage.evento_path(g_dest, e_dest, ext=p_src.suffix)
         if p_dest.is_file():
             print(f"Ya existe {g_dest}/{e_dest} → fusionando.")
             self._fusionar(g_dest, e_dest, g_src, e_src)
             return
         p_dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(p_src), str(p_dest))
-        self.storage.links.rename(g_src, e_src, g_dest, e_dest)
-        # mover info y gpg
+        shutil.move(p_src, p_dest)
+        origins = self.storage.links.get_origins(g_src, e_src)
+        for o in origins:
+            self.storage.links.add_origin(g_dest, e_dest, Path(o["path"]), o["copy"])
+        self.storage.links.remove_all_origins(g_src, e_src)
         info_txt = self.storage.info.get(g_src, e_src)
         if info_txt:
             self.storage.info.set(g_dest, e_dest, info_txt)
@@ -929,234 +1027,344 @@ class ByteApp:
             self.storage.gpg.mark(g_dest, e_dest, key_id)
             self.storage.gpg.unmark(g_src, e_src)
         self.storage.limpiar_vacios()
-        r_src  = self.ui.render_ruta(g_src, e_src)
+        r_src = self.ui.render_ruta(g_src, e_src)
         r_dest = self.ui.render_ruta(g_dest, e_dest)
-        print(f"{self.c.get('plus')}✓ Movido: {r_src} ➔ {r_dest}{self.c.get('rst')}")
+        print(f"{C('plus')}✓ Movido: {r_src} ➔ {r_dest}{C('rst')}")
 
-    def cmd_gpg(self, args):
-        """byte g evento [key_id ...]
-        Sin args sobre archivo ya cifrado: añade destinatario(s) adicionales.
-        Sobre archivo en claro: cifra. Para descifrar usar --nogpg.
-        """
+    def _fusionar(self, g_dest: str, e_dest: str, g_src: str, e_src: str) -> None:
+        if g_src == g_dest and e_src == e_dest:
+            print(f"{C('warn')}No se puede fusionar un evento consigo mismo.{C('rst')}")
+            return
+        p_src = self.storage.get_evento_path(g_src, e_src)
+        p_dest = self.storage.get_evento_path(g_dest, e_dest)
+        if not p_src or not p_src.is_file():
+            print(f"No existe: {g_src}/{e_src}")
+            return
+        p_dest_real = p_dest if p_dest else self.storage.evento_path(g_dest, e_dest)
+        p_dest_real.parent.mkdir(parents=True, exist_ok=True)
+        contenido_src = p_src.read_text(encoding="utf-8")
+        if p_dest_real.is_file():
+            contenido_dest = p_dest_real.read_text(encoding="utf-8")
+            sep = "\n\n---\n\n" if contenido_dest.strip() else ""
+            p_dest_real.write_text(contenido_dest + sep + contenido_src, encoding="utf-8")
+        else:
+            p_dest_real.write_text(contenido_src, encoding="utf-8")
+        src_origins = self.storage.links.get_origins(g_src, e_src)
+        for o in src_origins:
+            self.storage.links.add_origin(g_dest, e_dest, Path(o["path"]), o["copy"])
+        self.storage.links.remove_all_origins(g_src, e_src)
+        self.storage.info.remove(g_src, e_src)
+        self.storage.gpg.unmark(g_src, e_src)
+        p_src.unlink()
+        self.storage.limpiar_vacios()
+        r_src = self.ui.render_ruta(g_src, e_src)
+        r_dest = self.ui.render_ruta(g_dest, e_dest)
+        print(f"{C('plus')}✓ Fusionado: {r_src} ➔ {r_dest}{C('rst')}")
+
+    def cmd_mv(self, args: List[str]) -> None:
+        if not args:
+            self.ui.print_arbol()
+            opcion = self.ui.leer("¿[m]over o [f]usionar? (m/f): ").lower()
+            if opcion == "f":
+                g_dest = self.ui.pedir_grupo("Grupo destino")
+                e_dest = self.ui.pedir_evento(g_dest, "Evento destino")
+                g_src = self.ui.pedir_grupo("Grupo fuente")
+                e_src = self.ui.pedir_evento(g_src, "Evento fuente")
+                self._fusionar(g_dest, e_dest, g_src, e_src)
+            else:
+                g_src = self.ui.pedir_grupo("Grupo origen")
+                e_src = self.ui.pedir_evento(g_src, "Evento origen")
+                g_dest = self.ui.pedir_grupo("Grupo destino")
+                nuevo = self.ui.leer(f"Nuevo nombre (Enter = '{e_src}'): ") or e_src
+                if g_src == g_dest and self.storage.normalize(e_src) == self.storage.normalize(nuevo) and e_src != nuevo:
+                    self._renombrar(g_src, e_src, nuevo)
+                else:
+                    self._mover(g_src, e_src, g_dest, nuevo)
+            return
+
+        if len(args) == 1:
+            print("Uso: byte --mv [destino] [fuente]  |  byte --mv [origen] [Grupo/]")
+            return
+
+        a1, a2 = args[0], args[1]
+
+        g1, e1 = self.parse_arg(a1)
+        g2, e2 = self.parse_arg(a2)
+        if g1 and e1 and g2 and e2 and g1 == g2 and self.storage.normalize(e1) == self.storage.normalize(e2) and e1 != e2:
+            self._renombrar(g1, e1, e2)
+            return
+
+        if a2.endswith("/"):
+            g_src, e_src = self.resolver_arg(a1)
+            g_dest = self.find_grupo(a2.rstrip("/"))
+            if g_dest is None:
+                g_dest = self.storage.titulo(a2.rstrip("/"))
+            if not g_src or not e_src:
+                print(f"Origen no encontrado: '{a1}'")
+                return
+            self._mover(g_src, e_src, g_dest, e_src)
+            return
+
+        if "/" in a2:
+            g_src, e_src = self.resolver_arg(a1)
+            g_dest, e_dest = self.resolver_arg(a2)
+            if not g_src or not e_src:
+                print(f"Origen no encontrado: '{a1}'")
+                return
+            if not g_dest:
+                partes = a2.split("/")
+                g_dest = self.storage.titulo(partes[0])
+                e_dest = partes[1]
+            if not e_dest:
+                e_dest = e_src
+            p_dest = self.storage.get_evento_path(g_dest, e_dest)
+            if p_dest and p_dest.is_file():
+                self._fusionar(g_dest, e_dest, g_src, e_src)
+            else:
+                self._mover(g_src, e_src, g_dest, e_dest)
+            return
+
+        g_dest, e_dest = self.resolver_arg(a1)
+        g_src, e_src = self.resolver_arg(a2)
+        if not g_dest or not e_dest:
+            print(f"Destino no encontrado: '{a1}'")
+            return
+        if not g_src or not e_src:
+            print(f"Fuente no encontrado: '{a2}'")
+            return
+        self._fusionar(g_dest, e_dest, g_src, e_src)
+
+    def cmd_gpg(self, args: List[str]) -> None:
         if not shutil.which("gpg"):
-            return print("gpg no está disponible en el sistema.")
+            print("gpg no está disponible en el sistema.")
+            return
 
         if not args:
             self.ui.print_arbol()
             entrada = self.ui.leer("Evento: ")
-            if not entrada: return
+            if not entrada:
+                return
             extra_keys = []
         else:
-            entrada  = args[0]
-            extra_keys = args[1:]  # destinatarios adicionales (correos/fingerprints)
+            entrada = args[0]
+            extra_keys = args[1:]
 
         grupo, stem = self.resolver_arg(entrada)
         if not grupo:
-            stem  = entrada.lower()
+            stem = entrada
             grupo = self.ui.pedir_grupo(f"Grupo para '{stem}'")
-            if not grupo: return
+            if not grupo:
+                return
         if not stem:
             stem = self.ui.pedir_evento(grupo, "Evento")
-            if not stem: return
+            if not stem:
+                return
 
-        ev_path  = self.storage.get_evento_path(grupo, stem)
+        ev_path = self.storage.get_evento_path(grupo, stem)
         ruta_fmt = self.ui.render_ruta(grupo, stem)
         ya_cifrado = ev_path and ev_path.suffix.lower() == ".gpg"
+        d = C("date")
+        r = C("rst")
+        w = C("warn")
 
-        # ── Archivo ya cifrado: gestionar destinatarios ─────────────────
         if ya_cifrado:
-            key_actual = self.storage.gpg.key_id(grupo, stem) or self.gpg_key
-            # destinatarios registrados actualmente
+            key_actual = self.storage.gpg.key_id(grupo, stem) or self.config.gpg_key
             actuales = [k for k in (key_actual or "").split(",") if k]
-            d = self.c.get("date"); r2 = self.c.get("rst"); w = self.c.get("warn")
             if actuales:
-                print(f"  {w}g{r2} destinatarios actuales:")
+                print(f"  {w}g{r} destinatarios actuales:")
                 for k in actuales:
-                    print(f"    {d}{k}{r2}")
-
-            # keys pasadas por arg + las que se pidan interactivamente
+                    es_prim = (k == self.config.gpg_key)
+                    etiq = f"{w}primaria{r}" if es_prim else f"{d}secundaria{r}"
+                    print(f"    {d}{k}{r}  {etiq}")
             nuevas = list(extra_keys)
             while True:
-                resp = self.ui.leer("  Añadir llave (Enter para terminar): ")
+                resp = self.ui.leer(f"  Añadir llave secundaria {d}(Enter para terminar){r}: ")
                 if not resp:
                     break
                 nuevas.append(resp)
-
             if not nuevas:
-                print(f"{d}  Sin cambios.{r2}")
+                print(f"{d}  Sin cambios.{r}")
                 return
-
+            print(f"  {d}Nota: las llaves añadidas son secundarias — solo reciben el cifrado.{r}")
             todos_keys = list(actuales)
             for k in nuevas:
                 if k not in todos_keys:
                     todos_keys.append(k)
-
             try:
-                tmp = self._gpg_decrypt_to_tmp(ev_path)
+                tmp = self.storage._gpg_decrypt_to_tmp(ev_path)
             except RuntimeError as e:
-                return print(f"GPG error al descifrar: {e}")
+                print(f"GPG error al descifrar: {e}")
+                return
             inner_ext = Path(ev_path.stem).suffix or ".md"
             inner = ev_path.parent / f"{stem}{inner_ext}"
-            shutil.move(str(tmp), str(inner))
+            shutil.move(tmp, inner)
             ev_path.unlink()
             r_args = []
             for k in todos_keys:
                 r_args += ["-r", k]
             out = Path(str(inner) + ".gpg")
             res = subprocess.run(
-                ["gpg", "--yes", "--batch", "--trust-model", "always"] + r_args + ["-o", str(out), "-e", str(inner)],
-                capture_output=True)
-            inner.unlink(missing_ok=True)
+                ["gpg", "--yes", "--batch", "--trust-model", "always"] + r_args +
+                ["-o", str(out), "-e", str(inner)], capture_output=True)
+            inner.unlink()
             if res.returncode != 0:
-                return print(f"GPG error al re-cifrar: {res.stderr.decode()}")
+                print(f"GPG error al re-cifrar: {res.stderr.decode()}")
+                return
             self.storage.gpg.mark(grupo, stem, ",".join(todos_keys))
-            print(f"{self.c.get('plus')}~ {ruta_fmt}{r2}"
-                  f"  {w}g{r2} → {('  ').join(todos_keys)}")
+            print(f"{C('plus')}~ {ruta_fmt}{r}  {w}g{r} → {'  '.join(todos_keys)}")
             return
 
-        # ── Cifrar archivo en claro ───────────────────────────────────────
-        key_id = (extra_keys[0] if extra_keys else None) or self.gpg_key
-        if not key_id:
-            key_id = self.ui.leer("ID de llave GPG (email o fingerprint): ")
-            if not key_id: return
+        if not self.config.gpg_key:
+            print(f"{w}  Sin llave primaria configurada.{r}")
+            print(f"  Configúrala con {d}byte x{r} o añade {d}gpg_key = 'tu@correo'{r} en byte.toml")
+            return
+        if extra_keys:
+            print(f"  {d}Nota: para cifrar por primera vez se usa la configuración de byte.toml.{r}")
+            print(f"  {d}Para añadir destinatarios a un archivo ya cifrado, vuelve a ejecutar byte g.{r}")
 
-        # No existe aún → crear vacío primero
+        all_keys = [self.config.gpg_key] + [k for k in self.config.gpg_keys_secondary if k != self.config.gpg_key]
+
         if not ev_path or not ev_path.is_file():
             ev_path = self.storage.evento_path(grupo, stem, ext=".md")
             ev_path.parent.mkdir(parents=True, exist_ok=True)
             ev_path.touch()
 
-        all_keys = [key_id] + [k for k in extra_keys[1:] if k != key_id]
         r_args = []
         for k in all_keys:
             r_args += ["-r", k]
         out = Path(str(ev_path) + ".gpg")
         res = subprocess.run(
-            ["gpg", "--yes", "--batch", "--trust-model", "always"] + r_args + ["-o", str(out), "-e", str(ev_path)],
-            capture_output=True)
+            ["gpg", "--yes", "--batch", "--trust-model", "always"] + r_args +
+            ["-o", str(out), "-e", str(ev_path)], capture_output=True)
         if res.returncode != 0:
-            return print(f"GPG error: {res.stderr.decode()}")
+            print(f"GPG error: {res.stderr.decode()}")
+            return
         ev_path.unlink()
 
         self.storage.gpg.mark(grupo, stem, ",".join(all_keys))
-        link_origin = self.storage.links.get(grupo, stem)
-        if link_origin:
-            self.storage.links.register(grupo, stem, Path(link_origin), es_copia=True)
-        print(f"{self.c.get('plus')}~ {ruta_fmt}{self.c.get('rst')}"
-              f"  {self.c.get('warn')}g{self.c.get('rst')} cifrado → {'  '.join(all_keys)}")
+        origins = self.storage.links.get_origins(grupo, stem)
+        if origins:
+            for o in origins:
+                self.storage.links.add_origin(grupo, stem, Path(o["path"]), es_copia=True)
+        prim_fmt = f"{w}{self.config.gpg_key}{r}"
+        sec_fmt = ("  " + "  ".join(f"{d}{k}{r}" for k in all_keys[1:])) if all_keys[1:] else ""
+        print(f"{C('plus')}~ {ruta_fmt}{r}  {w}g{r} {prim_fmt}{sec_fmt}")
 
-    def cmd_nogpg(self, args):
-        """Desprotege y descifra un evento GPG, deja el archivo en claro."""
+    def cmd_nogpg(self, args: List[str]) -> None:
         if not shutil.which("gpg"):
-            return print("gpg no está disponible en el sistema.")
-
+            print("gpg no está disponible en el sistema.")
+            return
         if not args:
             self.ui.print_arbol()
             entrada = self.ui.leer("Evento a desproteger: ")
-            if not entrada: return
+            if not entrada:
+                return
         else:
             entrada = args[0]
-
         grupo, stem = self.resolver_arg(entrada)
         if not grupo:
-            stem  = entrada.lower()
+            stem = entrada
             grupo = self.ui.pedir_grupo(f"Grupo para '{stem}'")
-            if not grupo: return
+            if not grupo:
+                return
         if not stem:
             stem = self.ui.pedir_evento(grupo, "Evento")
-            if not stem: return
-
+            if not stem:
+                return
         ev_path = self.storage.get_evento_path(grupo, stem)
-        ruta_fmt = self.ui.render_ruta(grupo, stem)
-
         if not ev_path or ev_path.suffix.lower() != ".gpg":
-            return print(f"  {ruta_fmt} no está cifrado.")
-
-        if self.ui.leer(f"  Descifrar y desproteger {grupo}/{stem}? (s/n): ") != "s":
-            print(f"{self.c.get('date')}  Cancelado{self.c.get('rst')}")
+            print(f"  {self.ui.render_ruta(grupo, stem)} no está cifrado.")
             return
-
+        if self.ui.leer(f"  Descifrar y desproteger {grupo}/{stem}? (s/{C('date')}N{C('rst')}): ") != "s":
+            print(f"{C('date')}  Cancelado{C('rst')}")
+            return
         try:
-            tmp = self._gpg_decrypt_to_tmp(ev_path)
+            tmp = self.storage._gpg_decrypt_to_tmp(ev_path)
         except RuntimeError as e:
-            return print(f"GPG error: {e}")
-
-        inner_ext  = Path(ev_path.stem).suffix or ".md"
+            print(f"GPG error: {e}")
+            return
+        inner_ext = Path(ev_path.stem).suffix or ".md"
         clear_path = ev_path.parent / f"{stem}{inner_ext}"
-        shutil.move(str(tmp), str(clear_path))
+        shutil.move(tmp, clear_path)
         ev_path.unlink()
         self.storage.gpg.unmark(grupo, stem)
-        print(f"{self.c.get('plus')}~ {ruta_fmt}{self.c.get('rst')} (descifrado, sin protección GPG)")
+        print(f"{C('plus')}~ {self.ui.render_ruta(grupo, stem)}{C('rst')} (descifrado, sin protección GPG)")
 
-    def _leer_contenido(self, path: Path) -> str:
-        """Lee el contenido de un archivo, descifrando si es .gpg."""
-        if path.suffix.lower() == ".gpg":
-            try:
-                tmp = self._gpg_decrypt_to_tmp(path)
-                contenido = tmp.read_text(encoding="utf-8", errors="replace")
-                tmp.unlink(missing_ok=True)
-                return contenido
-            except RuntimeError:
-                return None  # GPG falló (llave no disponible, etc.)
-        return path.read_text(encoding="utf-8", errors="replace")
+    def cmd_check(self, args: List[str]) -> None:
+        c = C("header")
+        d = C("date")
+        r = C("rst")
+        w = C("warn")
 
-    def cmd_check(self, args):
-        """Detecta y sincroniza cambios en ambas direcciones para copias y enlaces GPG."""
+        print(f"\n{c}=== CONFIGURACIÓN ==={r}")
+        if self.config.used_config_path:
+            cfg_display = str(self.config.used_config_path).replace(str(Path.home()), "~")
+            print(f"Archivo de configuración: {cfg_display}")
+        else:
+            print("Archivo de configuración: (ninguno, usando por defecto)")
+        print(f"Directorio: {self.storage.base}")
+        print(f"Editor: {self.config.editor}")
+        if self.config.gpg_key:
+            print(f"Clave GPG primaria: {self.config.gpg_key}")
+        else:
+            print("Clave GPG primaria: (no configurada)")
+        if self.config.gpg_keys_secondary:
+            sec_list = ", ".join(self.config.gpg_keys_secondary)
+            print(f"Claves GPG secundarias: {sec_list}")
+        else:
+            print("Claves GPG secundarias: (ninguna)")
+        print()
+
         candidatos = []
         for g in self.storage.get_grupos():
             for stem in self.storage.get_eventos(g):
-                p = self.storage.get_evento_path(g, stem)
-                if not p: continue
-                is_copy = self.storage.links.is_copy(g, stem)
-                is_gpg_link = (p.suffix.lower() == ".gpg"
-                               and self.storage.links.is_registered(g, stem))
-                if is_copy or is_gpg_link:
-                    candidatos.append((g, stem, p))
+                ev_path = self.storage.get_evento_path(g, stem)
+                if not ev_path:
+                    continue
+                for o in self.storage.links.get_origins(g, stem):
+                    candidatos.append((g, stem, ev_path, o["path"], o["copy"]))
 
         if not candidatos:
-            print(f"{self.c.get('date')}  No hay copias ni enlaces cifrados registrados.{self.c.get('rst')}")
+            print(f"{d}No hay enlaces registrados.{r}")
             return
 
-        # clasificar: entrantes (origen→evento) y salientes (evento→origen)
         cambios_entrantes = []
-        salientes         = []
+        salientes = []
 
-        for g, stem, ev_path in candidatos:
-            origin = self.storage.links.origin(g, stem)
-            if not origin: continue
-            src = Path(origin)
+        for g, stem, ev_path, origin_str, es_copia in candidatos:
+            src = Path(origin_str)
             if not src.is_file():
-                print(f"{self.c.get('minus')}  {g}/{stem} — origen no disponible: "
-                      f"{self.ui._fmt_origin(str(src))}{self.c.get('rst')}")
+                print(f"{d}{g}/{stem} → origen no disponible: {self.ui._fmt_origin(origin_str)} (omitido){r}")
                 continue
 
             es_gpg = ev_path.suffix.lower() == ".gpg"
-            contenido_ev = self._leer_contenido(ev_path)
+            contenido_ev = self.storage.leer_evento(g, stem)
             if contenido_ev is None:
-                print(f"{self.c.get('warn')}  {g}/{stem} — no se pudo descifrar (GPG), omitido.{self.c.get('rst')}")
+                print(f"{w}{g}/{stem} — no se pudo descifrar (GPG), omitido.{r}")
                 continue
-            contenido_src = src.read_text(encoding="utf-8", errors="replace")
+            contenido_src = src.read_text(encoding="utf-8")
 
             if contenido_ev != contenido_src:
-                cambios_entrantes.append((g, stem, ev_path, src, es_gpg))
+                cambios_entrantes.append((g, stem, ev_path, src, es_gpg, es_copia))
             else:
-                salientes.append((g, stem, ev_path, src))
+                salientes.append((g, stem, ev_path, src, es_copia))
 
-        # --- dirección origen→evento ---
-        for g, stem, ev_path, src, es_gpg in cambios_entrantes:
+        for g, stem, ev_path, src, es_gpg, es_copia in cambios_entrantes:
+            if not es_copia:
+                continue
             origen_fmt = self.ui._fmt_origin(str(src))
-            ruta_fmt   = self.ui.render_ruta(g, stem)
-            gpg_tag    = f" {self.c.get('warn')}g{self.c.get('rst')}" if es_gpg else ""
-            print(f"\n{self.c.get('bold')}  {ruta_fmt}{self.c.get('rst')}{gpg_tag}"
-                  f"  {self.c.get('link')}c → {origen_fmt}{self.c.get('rst')}"
-                  f"  {self.c.get('date')}(origen modificado){self.c.get('rst')}")
+            ruta_fmt = self.ui.render_ruta(g, stem)
+            gpg_tag = f" {w}g{r}" if es_gpg else ""
+            print(f"\n{C('bold')}{ruta_fmt}{r}{gpg_tag}"
+                  f"  {C('link')}c → {origen_fmt}{r}"
+                  f"  {d}(origen modificado){r}")
             while True:
                 res = self.ui.leer("  ¿[s]incronizar origen→evento, [d]iff, [n]o? (s/d/n): ").lower()
                 if res == "d":
                     if es_gpg:
-                        tmp = self._gpg_decrypt_to_tmp(ev_path)
+                        tmp = self.storage._gpg_decrypt_to_tmp(ev_path)
                         mostrar_diff(tmp, src)
-                        tmp.unlink(missing_ok=True)
+                        tmp.unlink()
                     else:
                         mostrar_diff(ev_path, src)
                 elif res == "s":
@@ -1166,47 +1374,45 @@ class ByteApp:
                         inner = ev_path.parent / f"{stem}{inner_ext}"
                         shutil.copy2(src, inner)
                         ev_path.unlink()
-                        self._gpg_encrypt(inner, key_id)
-                        print(f"{self.c.get('plus')}  ✓ Actualizado y re-cifrado desde {origen_fmt}{self.c.get('rst')}")
+                        self.storage._gpg_encrypt(inner, key_id, ev_path)
+                        print(f"{C('plus')}  ✓ Actualizado y re-cifrado desde {origen_fmt}{r}")
                     else:
                         shutil.copy2(src, ev_path)
-                        print(f"{self.c.get('plus')}  ✓ Actualizado desde {origen_fmt}{self.c.get('rst')}")
+                        print(f"{C('plus')}  ✓ Actualizado desde {origen_fmt}{r}")
                     break
                 else:
-                    print(f"{self.c.get('date')}  Omitido{self.c.get('rst')}")
+                    print(f"{d}  Omitido{r}")
                     break
 
-        # --- dirección evento→origen ---
-        for g, stem, ev_path, src in salientes:
-            contenido_ev  = self._leer_contenido(ev_path)
-            contenido_src = src.read_text(encoding="utf-8", errors="replace")
+        for g, stem, ev_path, src, es_copia in salientes:
+            if not es_copia:
+                continue
+            contenido_ev = self.storage.leer_evento(g, stem)
+            if contenido_ev is None:
+                continue
+            contenido_src = src.read_text(encoding="utf-8")
             if contenido_ev == contenido_src:
                 continue
             origen_fmt = self.ui._fmt_origin(str(src))
-            ruta_fmt   = self.ui.render_ruta(g, stem)
-            print(f"\n{self.c.get('bold')}  {ruta_fmt}{self.c.get('rst')}"
-                  f"  {self.c.get('link')}→ {origen_fmt}{self.c.get('rst')}"
-                  f"  {self.c.get('date')}(evento modificado){self.c.get('rst')}")
+            ruta_fmt = self.ui.render_ruta(g, stem)
+            print(f"\n{C('bold')}{ruta_fmt}{r}"
+                  f"  {C('link')}→ {origen_fmt}{r}"
+                  f"  {d}(evento modificado){r}")
             while True:
                 res = self.ui.leer("  ¿[s]incronizar evento→origen, [d]iff, [n]o? (s/d/n): ").lower()
                 if res == "d":
                     mostrar_diff(src, ev_path)
                 elif res == "s":
                     shutil.copy2(ev_path, src)
-                    print(f"{self.c.get('plus')}  ✓ Origen actualizado: {origen_fmt}{self.c.get('rst')}")
+                    print(f"{C('plus')}  ✓ Origen actualizado: {origen_fmt}{r}")
                     break
                 else:
-                    print(f"{self.c.get('date')}  Omitido{self.c.get('rst')}")
+                    print(f"{d}  Omitido{r}")
                     break
 
-        # mensaje final si no hubo nada que reportar
-        if not cambios_entrantes and not any(
-            self._leer_contenido(ev) != src.read_text(encoding="utf-8", errors="replace")
-            for _, _, ev, src in salientes
-        ):
-            print(f"{self.c.get('date')}  Todo al día.{self.c.get('rst')}")
+        print(f"{d}Revisión completada.{r}")
 
-    def cmd_info(self, args):
+    def cmd_info(self, args: List[str]) -> None:
         if not args:
             encontrado = False
             for g in self.storage.get_grupos():
@@ -1214,95 +1420,143 @@ class ByteApp:
                     txt = self.storage.info.get(g, stem)
                     if txt:
                         ruta_fmt = self.ui.render_ruta(g, stem)
-                        print(f"  {ruta_fmt}  {self.c.get('date')}{txt}{self.c.get('rst')}")
+                        print(f"  {ruta_fmt}  {C('date')}{txt}{C('rst')}")
                         encontrado = True
             if not encontrado:
-                print(f"{self.c.get('date')}  (ningún evento tiene info){self.c.get('rst')}")
+                print(f"{C('date')}  (ningún evento tiene info){C('rst')}")
             return
 
         grupo, stem = self.resolver_arg(args[0])
         if not grupo:
-            stem  = args[0].lower()
+            stem = args[0]
             grupo = self.ui.pedir_grupo(f"Grupo para '{stem}'")
-            if not grupo: return
+            if not grupo:
+                return
         if not stem:
             stem = self.ui.pedir_evento(grupo, "Evento")
-            if not stem: return
+            if not stem:
+                return
 
         ruta_fmt = self.ui.render_ruta(grupo, stem)
+        d = C("date")
+        r = C("rst")
+        w = C("warn")
+
         if len(args) >= 2:
             texto = " ".join(args[1:])
             self.storage.info.set(grupo, stem, texto)
-            print(f"  {ruta_fmt}  {self.c.get('date')}{texto}{self.c.get('rst')}")
-        else:
-            txt = self.storage.info.get(grupo, stem)
+            print(f"{d}Nota guardada para {ruta_fmt}: {texto}{r}")
+            return
+
+        txt = self.storage.info.get(grupo, stem)
+        if txt:
+            print(f"{d}{txt}{r}")
+
+        info_lines = []
+        if self.storage.gpg.is_protected(grupo, stem):
+            info_lines.append(f"{w}Cifrado: {self.storage.gpg.key_id(grupo, stem)}{r}")
+        origins = self.storage.links.get_origins(grupo, stem)
+        if origins:
+            for o in origins:
+                path = o["path"]
+                es_copia = o["copy"]
+                disp = Path(path).is_file()
+                marca = "c →" if es_copia else "→"
+                if not disp:
+                    info_lines.append(f"  {marca} {d}{self.ui._fmt_origin(path)}{r} {w}(no disponible){r}")
+                else:
+                    info_lines.append(f"  {marca} {d}{self.ui._fmt_origin(path)}{r}")
+
+        if info_lines:
             if txt:
-                print(f"  {ruta_fmt}  {self.c.get('date')}{txt}{self.c.get('rst')}")
-            else:
-                print(f"  {ruta_fmt}  {self.c.get('date')}(sin info){self.c.get('rst')}")
+                print()
+            for line in info_lines:
+                print(line)
 
-    def cmd_config(self, args):
-        """Asistente de configuración inicial. Genera ~/.config/byte/byte.toml."""
-        c, r, d = self.c.get("bold"), self.c.get("rst"), self.c.get("date")
-        print(f"\n{c}BYTE — Configuración inicial{r}\n"
-              f"  Archivo: {CONFIG_PATH}\n"
-              f"  {d}(Enter = mantener valor actual){r}\n")
+    def cmd_config(self, args: List[str]) -> None:
+        c = C("bold")
+        r = C("rst")
+        d = C("date")
+        w = C("warn")
 
-        # base
-        base_actual = str(BASE)
+        system_path = Path.home() / ".config" / "byte" / "byte.toml"
+        if system_path.is_file():
+            target = system_path
+            disp = str(target).replace(str(Path.home()), "~")
+            print(f"\n{c}BYTE — Configuración (sistema){r}")
+        else:
+            vault_dir = self.config.base / ".byte"
+            vault_dir.mkdir(parents=True, exist_ok=True)
+            target = vault_dir / "byte.toml"
+            disp = str(target).replace(str(Path.home()), "~")
+            print(f"\n{c}BYTE — Configuración (portable en vault){r}")
+
+        print(f"Archivo: {disp}\n")
+
+        base_actual = str(self.config.base)
         resp = self.ui.leer(f"Directorio base [{base_actual}]: ")
-        nueva_base = resp if resp else base_actual
+        nueva_base = Path(resp).expanduser().resolve() if resp else self.config.base
 
-        # editor
-        editor_actual = EDITOR
+        editor_actual = self.config.editor
         resp = self.ui.leer(f"Editor [{editor_actual}]: ")
         nuevo_editor = resp if resp else editor_actual
 
-        # links
-        links_actual = str(LINKS)
-        resp = self.ui.leer(f"Archivo links [{links_actual}]: ")
-        nuevo_links = resp if resp else links_actual
+        gpg_actual = self.config.gpg_key or ""
+        print(f"\n{w}Llave GPG primaria{r}  (cifra y descifra)")
+        resp = self.ui.leer(f"[{gpg_actual or 'ninguna'}]: ")
+        nueva_primaria = resp if resp else gpg_actual
 
-        # info
-        info_actual = str(INFO)
-        resp = self.ui.leer(f"Archivo info [{info_actual}]: ")
-        nuevo_info = resp if resp else info_actual
+        sec_actual = list(self.config.gpg_keys_secondary)
+        print(f"\n{d}Llaves secundarias actuales{r}")
+        if sec_actual:
+            for k in sec_actual:
+                print(f"[{k}]")
+        else:
+            print(f"{d}(ninguna){r}")
 
-        # gpg key
-        gpg_actual = self.gpg_key or ""
-        resp = self.ui.leer(f"Llave GPG (email/fingerprint) [{gpg_actual or 'ninguna'}]: ")
-        nuevo_gpg = resp if resp else gpg_actual
+        nuevas_sec = []
+        while True:
+            resp = self.ui.leer(f"Nueva llave ({d}vacío termina, '-' borra todas{r}): ")
+            if not resp:
+                break
+            if resp == "-":
+                nuevas_sec = []
+                print(f"{d}Todas las secundarias serán eliminadas.{r}")
+                break
+            if "@" in resp and "." in resp.split("@")[1]:
+                nuevas_sec.append(resp)
+            else:
+                print(f"{w}Formato de correo inválido (debe contener @ y un dominio).{r}")
 
-        # previsualización
-        lineas = [
-            f'base   = "{nueva_base}"',
-            f'editor = "{nuevo_editor}"',
-            f'links  = "{nuevo_links}"',
-            f'info   = "{nuevo_info}"',
-        ]
-        if nuevo_gpg:
-            lineas.append(f'gpg_key = "{nuevo_gpg}"')
+        if not nuevas_sec and resp != "-":
+            nuevas_sec = sec_actual
 
-        contenido = "\n".join(lineas) + "\n"
+        lines = [f'base   = "{nueva_base}"', f'editor = "{nuevo_editor}"']
+        if nueva_primaria:
+            lines.append(f'gpg_key = "{nueva_primaria}"')
+        lines.append(f'gpg_keys_secondary = [{", ".join(f"\"{k}\"" for k in nuevas_sec)}]' if nuevas_sec else 'gpg_keys_secondary = []')
+        contenido = "\n".join(lines) + "\n"
         print(f"\n{d}--- byte.toml ---{r}")
         print(contenido)
 
-        if self.ui.leer("¿Guardar? (s/n): ") == "s":
-            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-            CONFIG_PATH.write_text(contenido, encoding="utf-8")
-            print(f"{self.c.get('plus')}✓ Guardado en {CONFIG_PATH}{r}")
+        resp = self.ui.leer(f"¿Guardar? (s/{d}N{r}): ").lower()
+        if resp == "s":
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(contenido, encoding="utf-8")
+            print(f"{C('plus')}✓ Guardado en {disp}{r}")
+            self.config.base = nueva_base
+            self.config.editor = nuevo_editor
+            self.config.gpg_key = nueva_primaria
+            self.config.gpg_keys_secondary = nuevas_sec
+            self.config.used_config_path = target
+            self.storage = ByteStorage(self.config.base)
+            self.ui = ByteInterface(self.storage)
+            if nueva_base != self.config.base:
+                print(f"{w}Cambio de BASE aplicado (recreado el storage).{r}")
         else:
-            print(f"{d}  Cancelado{r}")
+            print(f"{d}Cancelado{r}")
 
-    def cmd_dir(self, args):
-        d = self.c.get("date"); r = self.c.get("rst")
-        print(f"  base:   {self.storage.base}")
-        print(f"  links:  {self.storage.links.path}")
-        print(f"  info:   {self.storage.info.path}")
-        print(f"  config: {CONFIG_PATH}")
-        print(f"  gpg:    {self.storage.gpg.path}")
-
-    def cmd_complete(self, args):
+    def cmd_complete(self, args: List[str]) -> None:
         tokens = []
         for g in self.storage.get_grupos():
             tokens.append(f"{g}/")
@@ -1310,10 +1564,12 @@ class ByteApp:
                 tokens.append(f"{g}/{e}")
         print(" ".join(tokens))
 
-    def mostrar_ayuda(self):
-        h = self.c.get("header"); t = self.c.get("tree")
-        d = self.c.get("date");   r = self.c.get("rst")
-        w = self.c.get("warn")
+    def mostrar_ayuda(self) -> None:
+        h = C("header")
+        t = C("tree")
+        d = C("date")
+        r = C("rst")
+        w = C("warn")
         print(f"{h}BYTE — Notas en Markdown{r}\n")
         print(f"  {t}byte{r}              {d}árbol{r}")
         print(f"  {t}byte -t{r}           {d}árbol con fechas{r}")
@@ -1321,56 +1577,30 @@ class ByteApp:
         print()
         print(f"  {h}Abrir / añadir{r}")
         print(f"  {t}byte{r} {d}evento{r}              abre en editor  {d}(crea .md si no existe){r}")
-        print(f"  {t}byte{r} {d}evento{r} texto...      añade línea al final")
+        print(f"  {t}byte{r} {d}evento{r} texto...      añade línea al final sin abrir editor")
         print(f"  {t}byte{r} {d}Grupo/evento{r}         abre evento explícito")
         print()
         print(f"  {h}Comandos{r}  {d}--comando  ·  letra{r}")
-        print(f"  {t}--link    {d}l{r}  archivo {d}[nombre]{r}    hardlink/copia → evento")
+        print(f"  {t}--link    {d}l{r}  archivo {d}[nombre]{r}    hardlink/copia de archivo externo → evento")
+        print(f"  {t}--unlink  {d}u{r}  {d}[evento]{r}            quita el registro del enlace {d}(archivos intactos){r}")
         print(f"  {t}--del     {d}d{r}  {d}[ruta]{r}              envía al .trash/")
-        print(f"  {t}--mv      {d}m{r}  {d}[origen] [destino]{r}  mueve o fusiona")
-        print(f"  {t}--info    {d}i{r}  {d}[evento] [texto]{r}    muestra o establece nota corta")
-        print(f"  {t}--gpg     {d}g{r}  evento {d}[key]{r}        cifra con GPG")
+        print(f"  {t}--mv      {d}m{r}  {d}[origen] [destino]{r}  mueve o fusiona eventos")
+        print(f"  {t}--info    {d}i{r}  {d}[evento] [texto]{r}    nota corta asociada al evento")
+        print(f"  {t}--gpg     {d}g{r}  evento {d}[llave]{r}      cifra con primaria+secundarias; sobre cifrado: añade secundaria")
         print(f"  {t}--nogpg   {d}q{r}  evento              descifra y elimina protección GPG")
-        print(f"  {t}--check   {d}c{r}                      sincroniza cambios {d}(ambas direcciones){r}")
-        print(f"  {t}--unlink  {d}u{r}  {d}[evento]{r}            elimina registro del enlace")
+        print(f"  {t}--check   {d}c{r}                      muestra configuración y sincroniza copias/enlaces")
         print(f"  {t}--config  {d}x{r}                      configuración inicial")
-        print(f"  {t}--dir{r}                          rutas activas")
         print()
         print(f"  {h}Indicadores en el árbol{r}")
-        print(f"  {w}g{r} gpg   {d}i{r} info   {d}c →{r} copia   {d}→{r} hardlink   {d}✗ →{r} enlace roto")
+        print(f"  {w}g{r} gpg   {w}i{r} info   {d}→{r} hardlink   {d}c →{r} copia   {d}✗{r} enlace roto")
 
+# ============================================================================
+# PUNTO DE ENTRADA
+# ============================================================================
 
-# ===== DISPATCH TABLE =====
-def build_dispatch(app):
-    return {
-        "link":      app.cmd_link,
-        "del":       app.cmd_del,
-        "mv":        app.cmd_mv,
-        "info":      app.cmd_info,
-        "gpg":       app.cmd_gpg,
-        "nogpg":     app.cmd_nogpg,
-        "check":     app.cmd_check,
-        "unlink":    app.cmd_unlink,
-        "config":    app.cmd_config,
-        "dir":       app.cmd_dir,
-        "_complete": app.cmd_complete,
-        # letras cortas (sin guion)
-        "l": app.cmd_link,
-        "d": app.cmd_del,
-        "m": app.cmd_mv,
-        "i": app.cmd_info,
-        "g": app.cmd_gpg,
-        "q": app.cmd_nogpg,
-        "c": app.cmd_check,
-        "u": app.cmd_unlink,
-        "x": app.cmd_config,
-    }
-
-
-# ===== MAIN =====
-def main():
-    app      = ByteApp(base_path=BASE, editor_name=EDITOR, links_path=LINKS, info_path=INFO)
-    dispatch = build_dispatch(app)
+def main() -> None:
+    config = Config()
+    app = ByteApp(config)
     app.storage.asegurar_base()
 
     args = sys.argv[1:]
@@ -1379,30 +1609,31 @@ def main():
         app.ui.print_arbol()
         return
 
-    cmd  = args[0]
+    cmd = args[0]
     rest = args[1:]
 
-    # Flags globales
-    if cmd in ["-t", "--total", "-v"]:
+    if cmd in ("-t", "--total", "-v"):
         app.ui.print_arbol(show_dates=True)
         return
-    # Ayuda: todas las variantes
-    if cmd in ["-h", "--help", "help", "h"]:
+    if cmd in ("-h", "--help", "help", "h"):
         app.mostrar_ayuda()
         return
 
-    # Normalizar: --comando → comando  |  letra sola sin guion
-    if cmd.startswith("--"):
-        cmd_clean = cmd[2:]
-    else:
-        cmd_clean = cmd  # letras cortas sin guion, o token libre
+    cmd_clean = cmd[2:] if cmd.startswith("--") else cmd
+    dispatch = {
+        "link": app.cmd_link, "del": app.cmd_del, "mv": app.cmd_mv,
+        "info": app.cmd_info, "gpg": app.cmd_gpg, "nogpg": app.cmd_nogpg,
+        "check": app.cmd_check, "unlink": app.cmd_unlink, "config": app.cmd_config,
+        "_complete": app.cmd_complete,
+        "l": app.cmd_link, "d": app.cmd_del, "m": app.cmd_mv,
+        "i": app.cmd_info, "g": app.cmd_gpg, "q": app.cmd_nogpg,
+        "c": app.cmd_check, "u": app.cmd_unlink, "x": app.cmd_config,
+    }
 
     if cmd_clean in dispatch:
         dispatch[cmd_clean](rest)
     else:
-        # token libre → abrir/crear evento (nunca colisiona con comandos)
         app.cmd_open([cmd] + rest)
-
 
 if __name__ == "__main__":
     main()
