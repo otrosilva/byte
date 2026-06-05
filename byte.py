@@ -262,6 +262,19 @@ class GpgRegistry(JsonRegistry):
         self._load()
         return self._data.get(self._key(grupo, stem))
 
+    def can_decrypt(self, grupo: str, stem: str) -> bool:
+        """Verifica si la clave secreta correspondiente al evento está disponible."""
+        key_id = self.key_id(grupo, stem)
+        if not key_id:
+            return False
+        # Tomar la primera clave de la lista (por simplicidad)
+        first_key = key_id.split(",")[0].strip()
+        result = subprocess.run(
+            ["gpg", "--list-secret-keys", "--with-colons", first_key],
+            capture_output=True, text=True
+        )
+        return result.returncode == 0 and "sec:" in result.stdout
+
 # ============================================================================
 # ALMACENAMIENTO (case‑sensitive)
 # ============================================================================
@@ -395,9 +408,29 @@ class ByteStorage:
             tmp_path.unlink()
 
     def _gpg_encrypt(self, plain_path: Path, key_id: str, output_path: Path) -> None:
+        # Si la clave contiene comas, son múltiples destinatarios
+        if "," in key_id:
+            keys = [k.strip() for k in key_id.split(",") if k.strip()]
+            return self._gpg_encrypt_multiple(plain_path, keys, output_path)
+
         out = output_path if output_path.suffix == ".gpg" else output_path.with_suffix(output_path.suffix + ".gpg")
-        res = subprocess.run(["gpg", "--yes", "--batch", "--trust-model", "always",
-                              "-r", key_id, "-o", str(out), "-e", str(plain_path)], capture_output=True)
+        res = subprocess.run(
+            ["gpg", "--yes", "--batch", "--trust-model", "always",
+             "-r", key_id, "-o", str(out), "-e", str(plain_path)],
+            capture_output=True
+        )
+        if res.returncode != 0:
+            raise RuntimeError(res.stderr.decode())
+        if out != output_path:
+            out.rename(output_path)
+
+    def _gpg_encrypt_multiple(self, plain_path: Path, keys: List[str], output_path: Path) -> None:
+        out = output_path if output_path.suffix == ".gpg" else output_path.with_suffix(output_path.suffix + ".gpg")
+        cmd = ["gpg", "--yes", "--batch", "--trust-model", "always"]
+        for k in keys:
+            cmd += ["-r", k]
+        cmd += ["-o", str(out), "-e", str(plain_path)]
+        res = subprocess.run(cmd, capture_output=True)
         if res.returncode != 0:
             raise RuntimeError(res.stderr.decode())
         if out != output_path:
@@ -408,7 +441,10 @@ class ByteStorage:
         tmp = tempfile.NamedTemporaryFile(suffix=inner_ext, delete=False)
         tmp.close()
         tmp_path = Path(tmp.name)
-        res = subprocess.run(["gpg", "--yes", "--batch", "-o", str(tmp_path), "-d", str(path)], capture_output=True)
+        res = subprocess.run(
+            ["gpg", "--yes", "--batch", "-o", str(tmp_path), "-d", str(path)],
+            capture_output=True
+        )
         if res.returncode != 0:
             tmp_path.unlink()
             raise RuntimeError(res.stderr.decode())
@@ -505,9 +541,13 @@ class ByteInterface:
 
                 event_render = _resaltar(stem, e_abbr.get(stem), 2, C("event"), C("bold"))
 
+                # Badges: GPG (con ? si no se puede descifrar) e info
                 badges = ""
                 if self.storage.gpg.is_protected(grupo, stem):
-                    badges += f" {w}g{r}"
+                    if self.storage.gpg.can_decrypt(grupo, stem):
+                        badges += f" {w}g{r}"
+                    else:
+                        badges += f" {w}g?{r}"
                 if self.storage.info.has(grupo, stem):
                     badges += f" {w}i{r}"
 
@@ -1370,11 +1410,25 @@ class ByteApp:
                 elif res == "s":
                     if es_gpg:
                         key_id = self.storage.gpg.key_id(g, stem)
+                        # Dividir en múltiples claves si es necesario
+                        keys = [k.strip() for k in key_id.split(",") if k.strip()]
+                        # Verificar que todas las claves públicas existan
+                        missing = []
+                        for k in keys:
+                            res_check = subprocess.run(
+                                ["gpg", "--list-keys", "--with-colons", k],
+                                capture_output=True, text=True
+                            )
+                            if res_check.returncode != 0 or "pub:" not in res_check.stdout:
+                                missing.append(k)
+                        if missing:
+                            print(f"{C('warn')}  No se puede cifrar: faltan las claves públicas {', '.join(missing)}{C('rst')}")
+                            break
                         inner_ext = Path(ev_path.stem).suffix or ".md"
                         inner = ev_path.parent / f"{stem}{inner_ext}"
                         shutil.copy2(src, inner)
                         ev_path.unlink()
-                        self.storage._gpg_encrypt(inner, key_id, ev_path)
+                        self.storage._gpg_encrypt_multiple(inner, keys, ev_path)
                         print(f"{C('plus')}  ✓ Actualizado y re-cifrado desde {origen_fmt}{r}")
                     else:
                         shutil.copy2(src, ev_path)
@@ -1592,7 +1646,7 @@ class ByteApp:
         print(f"  {t}--config  {d}x{r}                      configuración inicial")
         print()
         print(f"  {h}Indicadores en el árbol{r}")
-        print(f"  {w}g{r} gpg   {w}i{r} info   {d}→{r} hardlink   {d}c →{r} copia   {d}✗{r} enlace roto")
+        print(f"  {w}g{r} gpg (o {w}g?{r} sin clave)   {w}i{r} info   {d}→{r} hardlink   {d}c →{r} copia   {d}✗{r} enlace roto")
 
 # ============================================================================
 # PUNTO DE ENTRADA
