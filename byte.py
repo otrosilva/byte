@@ -160,20 +160,24 @@ def _diff_tool() -> Optional[str]:
 def mostrar_diff(a: Path, b: Path) -> None:
     tool = _diff_tool()
     a_str, b_str = str(a), str(b)
+    # Obtener el diff
+    r = subprocess.run(["diff", "-u", a_str, b_str], capture_output=True, text=True)
+    if not r.stdout.strip():
+        print("  (sin diferencias)")
+        return
     if tool == "delta":
-        os.system(f'diff -u "{a_str}" "{b_str}" | delta')
+        # delta por defecto puede paginar; forzamos a que muestre todo sin paginador
+        os.system(f'diff -u "{a_str}" "{b_str}" | delta --paging=never')
     elif tool == "bat":
-        r = subprocess.run(["diff", "-u", a_str, b_str], capture_output=True, text=True)
-        if r.stdout:
-            tmp = tempfile.NamedTemporaryFile(suffix=".diff", delete=False, mode="w")
-            tmp.write(r.stdout)
-            tmp.close()
-            os.system(f'bat --language=diff "{tmp.name}"')
-            Path(tmp.name).unlink()
-        else:
-            print("  (sin diferencias)")
+        # bat también puede paginar; usamos --pager=never
+        tmp = tempfile.NamedTemporaryFile(suffix=".diff", delete=False, mode="w")
+        tmp.write(r.stdout)
+        tmp.close()
+        os.system(f'bat --language=diff --pager=never "{tmp.name}"')
+        Path(tmp.name).unlink()
     else:
-        os.system(f'diff -u "{a_str}" "{b_str}"')
+        # Si no hay herramienta, imprimir crudo
+        print(r.stdout, end="")
 
 def calcular_md5(path: Path) -> str:
     hash_md5 = hashlib.md5()
@@ -1160,13 +1164,20 @@ class ByteApp:
         else:
             archivo = args[0]
             segundo = args[1]
-            if "/" in segundo:
-                partes = segundo.split("/", 1)
-                grupo_hint = self.find_grupo(partes[0]) or self.storage.titulo(partes[0])
-                stem_override = partes[1] if partes[1] else None
+            # Intentar resolver como grupo/evento (con / o .)
+            g_res, e_res = self.parse_arg(segundo)
+            if g_res is not None and e_res is not None:
+                grupo_hint = g_res
+                stem_override = e_res
             else:
-                grupo_hint = None
-                stem_override = segundo
+                # Si no se puede resolver, tratar como nombre directo (puede contener extensión)
+                if "/" in segundo:
+                    partes = segundo.split("/", 1)
+                    grupo_hint = self.find_grupo(partes[0]) or self.storage.titulo(partes[0])
+                    stem_override = partes[1] if partes[1] else None
+                else:
+                    grupo_hint = None
+                    stem_override = segundo
 
         src = Path(archivo).expanduser().resolve()
         src_exists = src.is_file()
@@ -1180,17 +1191,32 @@ class ByteApp:
             if not grupo:
                 return
 
+        # Procesar stem_override (puede ser nombre de evento o abreviatura)
         if stem_override:
-            p_override = Path(stem_override)
-            if p_override.suffix in EXT_TEXTO | {".gpg"}:
-                stem = p_override.stem
-                ext = p_override.suffix
+            # Intentar resolver como evento dentro del grupo (abreviatura o nombre)
+            evs = self.storage.get_eventos(grupo)
+            e_abbr = self.ui._get_abreviaturas(grupo, 2)
+            # Buscar si es abreviatura
+            encontrado = None
+            for ev, ab in e_abbr.items():
+                if ab == stem_override.lower():
+                    encontrado = ev
+                    break
+            if encontrado:
+                stem = encontrado
+                ext = ""  # Se recalculará con src.suffix
             else:
-                stem = stem_override
-                if src.suffix and src.suffix.lower() in EXT_TEXTO:
-                    ext = src.suffix.lower()
+                # Puede ser nombre con extensión
+                p_override = Path(stem_override)
+                if p_override.suffix in EXT_TEXTO | {".gpg"}:
+                    stem = p_override.stem
+                    ext = p_override.suffix
                 else:
-                    ext = ""
+                    stem = stem_override
+                    if src.suffix and src.suffix.lower() in EXT_TEXTO:
+                        ext = src.suffix.lower()
+                    else:
+                        ext = ""
         else:
             stem = src.stem
             if src.suffix and src.suffix.lower() in EXT_TEXTO:
@@ -1292,7 +1318,7 @@ class ByteApp:
             return
 
         print(f"{C('minus')}  Ni el archivo externo ni el evento existen. Nada que hacer.{C('rst')}")
-
+        
     def cmd_unlink(self, args: List[str]) -> None:
         if not args:
             enlazados = []
@@ -1832,16 +1858,16 @@ class ByteApp:
             gpg_tag = f" {w}g{r}" if es_gpg else ""
             print(f"\n{C('bold')}{ruta_fmt}{r}{gpg_tag}"
                   f"  {C('link')}c → {origen_fmt}{r}"
-                  f"  {d}(origen modificado){r}")
+                  f"  {d}(modificado){r}")
 
             es_binario_origen = detectar_tipo_archivo(src) == "binary"
             es_binario_evento = not es_gpg and self.storage.registry.get_type(g, stem) == "binary"
 
             while True:
                 if es_binario_origen or es_binario_evento:
-                    res = self.ui.leer("  ¿[s]incronizar origen→evento, [m]d5, [n]o? (s/m/n): ").lower()
+                    res = self.ui.leer("  ¿[o] origen→evento, [e] evento→origen, [m]d5, [N]o? (o/e/m/N): ").lower()
                 else:
-                    res = self.ui.leer("  ¿[s]incronizar origen→evento, [d]iff, [n]o? (s/d/n): ").lower()
+                    res = self.ui.leer("  ¿[o] origen→evento, [e] evento→origen, [d]iff, [N]o? (o/e/d/N): ").lower()
 
                 if res == "m" and (es_binario_origen or es_binario_evento):
                     md5_src = calcular_md5(src)
@@ -1860,7 +1886,8 @@ class ByteApp:
                         tmp.unlink()
                     else:
                         mostrar_diff(ev_path, src)
-                elif res == "s":
+                elif res == "o":
+                    # Origen → evento
                     if es_gpg:
                         key_id = self.storage.registry.key_id(g, stem)
                         keys = [k.strip() for k in key_id.split(",") if k.strip()]
@@ -1880,14 +1907,30 @@ class ByteApp:
                         shutil.copy2(src, inner)
                         ev_path.unlink()
                         self.storage._gpg_encrypt(inner, key_id, ev_path)
-                        print(f"{C('plus')}  ✓ Actualizado y re-cifrado desde {origen_fmt}{r}")
+                        print(f"{C('plus')}  ✓ Actualizado evento desde origen (re-cifrado){r}")
                     else:
                         shutil.copy2(src, ev_path)
-                        print(f"{C('plus')}  ✓ Actualizado desde {origen_fmt}{r}")
+                        print(f"{C('plus')}  ✓ Evento actualizado desde origen{r}")
                     self.storage._invalidar_cache_grupo(g)
                     self.ui.invalidar_cache_abreviaturas(g)
                     tipo = detectar_tipo_archivo(ev_path)
                     self.storage.registry.set_type(g, stem, tipo)
+                    break
+                elif res == "e":
+                    # Evento → origen
+                    if es_gpg:
+                        try:
+                            tmp = self.storage._gpg_decrypt_to_tmp(ev_path)
+                        except RuntimeError as e:
+                            print(f"GPG error al descifrar: {e}")
+                            break
+                        shutil.copy2(tmp, src)
+                        tmp.unlink()
+                        print(f"{C('plus')}  ✓ Origen actualizado desde evento (descifrado){r}")
+                    else:
+                        shutil.copy2(ev_path, src)
+                        print(f"{C('plus')}  ✓ Origen actualizado desde evento{r}")
+                    # No es necesario invalidar caché del vault
                     break
                 else:
                     print(f"{d}  Omitido{r}")
@@ -1909,16 +1952,16 @@ class ByteApp:
             origen_fmt = self.ui._fmt_origin(str(src))
             ruta_fmt = self.ui.render_ruta(g, stem)
             print(f"\n{C('bold')}{ruta_fmt}{r}"
-                  f"  {C('link')}→ {origen_fmt}{r}"
-                  f"  {d}(evento modificado){r}")
+                  f"  {C('link')}c → {origen_fmt}{r}"
+                  f"  {d}(modificado){r}")
 
             es_binario_evento = self.storage.registry.get_type(g, stem) == "binary"
 
             while True:
                 if es_binario_evento:
-                    res = self.ui.leer("  ¿[s]incronizar evento→origen, [m]d5, [n]o? (s/m/n): ").lower()
+                    res = self.ui.leer("  ¿[o] origen→evento, [e] evento→origen, [m]d5, [N]o? (o/e/m/N): ").lower()
                 else:
-                    res = self.ui.leer("  ¿[s]incronizar evento→origen, [d]iff, [n]o? (s/d/n): ").lower()
+                    res = self.ui.leer("  ¿[o] origen→evento, [e] evento→origen, [d]iff, [N]o? (o/e/d/N): ").lower()
 
                 if res == "m" and es_binario_evento:
                     md5_src = calcular_md5(src)
@@ -1932,9 +1975,41 @@ class ByteApp:
                     print(f"  MD5 evento:  {md5_ev}")
                 elif res == "d" and not es_binario_evento:
                     mostrar_diff(src, ev_path)
-                elif res == "s":
-                    shutil.copy2(ev_path, src)
-                    print(f"{C('plus')}  ✓ Origen actualizado: {origen_fmt}{r}")
+                elif res == "o":
+                    # Origen → evento (sobrescribe evento con origen)
+                    if ev_path.suffix.lower() == ".gpg":
+                        key_id = self.storage.registry.key_id(g, stem)
+                        if not key_id:
+                            print(f"{C('warn')}  No hay clave GPG registrada. No se puede re-cifrar.{r}")
+                            break
+                        inner_ext = Path(ev_path.stem).suffix or ".md"
+                        inner = ev_path.parent / f"{stem}{inner_ext}"
+                        shutil.copy2(src, inner)
+                        ev_path.unlink()
+                        self.storage._gpg_encrypt(inner, key_id, ev_path)
+                        print(f"{C('plus')}  ✓ Evento actualizado desde origen (re-cifrado){r}")
+                    else:
+                        shutil.copy2(src, ev_path)
+                        print(f"{C('plus')}  ✓ Evento actualizado desde origen{r}")
+                    self.storage._invalidar_cache_grupo(g)
+                    self.ui.invalidar_cache_abreviaturas(g)
+                    tipo = detectar_tipo_archivo(ev_path)
+                    self.storage.registry.set_type(g, stem, tipo)
+                    break
+                elif res == "e":
+                    # Evento → origen
+                    if ev_path.suffix.lower() == ".gpg":
+                        try:
+                            tmp = self.storage._gpg_decrypt_to_tmp(ev_path)
+                        except RuntimeError as e:
+                            print(f"GPG error al descifrar: {e}")
+                            break
+                        shutil.copy2(tmp, src)
+                        tmp.unlink()
+                        print(f"{C('plus')}  ✓ Origen actualizado desde evento (descifrado){r}")
+                    else:
+                        shutil.copy2(ev_path, src)
+                        print(f"{C('plus')}  ✓ Origen actualizado desde evento{r}")
                     break
                 else:
                     print(f"{d}  Omitido{r}")
