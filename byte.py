@@ -1769,7 +1769,8 @@ class ByteApp:
             print(f"Archivo de configuración: {cfg_display}")
         else:
             print("Archivo de configuración: (ninguno, usando por defecto)")
-        print(f"Directorio: {self.storage.base}")
+        base_display = str(self.storage.base).replace(str(Path.home()), "~")
+        print(f"Directorio: {base_display}")
         print(f"Editor: {self.config.editor}")
         if self.config.gpg_key:
             print(f"Clave GPG primaria: {self.config.gpg_key}")
