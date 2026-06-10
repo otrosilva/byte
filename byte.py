@@ -202,12 +202,12 @@ def _resaltar(texto: str, abrev: Optional[str], long: int, color_norm: str, colo
     return f"{color_norm}{texto} {color_res}{abrev}{C('rst')}"
 
 # ============================================================================
-# REGISTRO ÚNICO (registry.json)
+# REGISTRO ÚNICO (byte.json)
 # ============================================================================
 
 class Registry:
     def __init__(self, base: Path):
-        self.path = base / ".byte" / "registry.json"
+        self.path = base / ".byte" / "byte.json"
         self._data = None
         self._mtime: float = 0.0
         self._load()
@@ -234,7 +234,7 @@ class Registry:
         self._mtime = self.path.stat().st_mtime
 
     def _default_data(self):
-        return {"links": {}, "info": {}, "gpg": {}}
+        return {"links": {}, "info": {}, "gpg": {}, "abbr_cache": {}}
 
     def _key(self, grupo: str, stem: str) -> str:
         return f"{grupo}/{stem}"
@@ -350,46 +350,13 @@ class Registry:
             self._data["gpg"][key_dst] = self._data["gpg"].pop(key_src)
             self._save()
 
-    # --- migración ---
-    @classmethod
-    def migrate_from_old(cls, base: Path) -> None:
-        old_links = base / ".byte" / "links.json"
-        old_info = base / ".byte" / "info.json"
-        old_gpg = base / ".byte" / "gpg.json"
-        registry_path = base / ".byte" / "registry.json"
-        if registry_path.exists():
-            return
-        data = {"links": {}, "info": {}, "gpg": {}}
-        if old_links.exists():
-            try:
-                with open(old_links, "r", encoding="utf-8") as f:
-                    links_data = json.load(f)
-                for k, v in links_data.items():
-                    if isinstance(v, dict):
-                        data["links"][k] = [v]
-                    elif isinstance(v, list):
-                        data["links"][k] = v
-            except Exception:
-                pass
-        if old_info.exists():
-            try:
-                with open(old_info, "r", encoding="utf-8") as f:
-                    info_data = json.load(f)
-                for k, v in info_data.items():
-                    if isinstance(v, str):
-                        data["info"][k] = {"info": v, "type": "text"}
-                    else:
-                        data["info"][k] = v
-            except Exception:
-                pass
-        if old_gpg.exists():
-            try:
-                with open(old_gpg, "r", encoding="utf-8") as f:
-                    data["gpg"] = json.load(f)
-            except Exception:
-                pass
-        with open(registry_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+    # --- abbr_cache (persistente) ---
+    def get_abbr_cache(self) -> Dict[str, Dict]:
+        return self._data.get("abbr_cache", {})
+
+    def set_abbr_cache(self, abbr_cache: Dict[str, Dict]) -> None:
+        self._data["abbr_cache"] = abbr_cache
+        self._save()
 
 # ============================================================================
 # ALMACENAMIENTO CON CACHÉ DE DIRECTORIOS
@@ -405,7 +372,6 @@ class ByteStorage:
     def asegurar_base(self) -> None:
         self.base.mkdir(parents=True, exist_ok=True)
         self.byte_dir.mkdir(parents=True, exist_ok=True)
-        Registry.migrate_from_old(self.base)
 
     def _listar_grupo(self, grupo: str) -> List[Path]:
         gp = self.base / grupo
@@ -558,38 +524,23 @@ class ByteStorage:
         return tmp_path
 
 # ============================================================================
-# INTERFAZ (con caché de abreviaturas persistente)
+# INTERFAZ (con caché de abreviaturas dentro de byte.json)
 # ============================================================================
 
 class ByteInterface:
     def __init__(self, storage: ByteStorage):
         self.storage = storage
-        self.cache_file = storage.byte_dir / "abbr_cache.json"
+        self.registry = storage.registry
         self._cache_abbr: Dict[Tuple[str, int], Dict[str, str]] = {}
-        self._persistent_cache: Dict[str, Dict] = {}
-        self._load_persistent_cache()
+        self._load_abbr_from_registry()
 
-    def _load_persistent_cache(self) -> None:
-        """Carga el archivo de caché persistente."""
-        if not self.cache_file.is_file():
-            return
-        try:
-            with open(self.cache_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            for grupo, info in data.items():
-                if "mtime" in info and "abbr" in info:
-                    self._persistent_cache[grupo] = info
-        except Exception:
-            pass
+    def _load_abbr_from_registry(self) -> None:
+        """Carga la caché de abreviaturas desde el registro (byte.json)."""
+        self._persistent_cache = self.registry.get_abbr_cache()
 
-    def _save_persistent_cache(self) -> None:
-        """Guarda la caché persistente en disco."""
-        try:
-            self.cache_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.cache_file, "w", encoding="utf-8") as f:
-                json.dump(self._persistent_cache, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass
+    def _save_abbr_to_registry(self) -> None:
+        """Guarda la caché de abreviaturas en el registro."""
+        self.registry.set_abbr_cache(self._persistent_cache)
 
     def _get_abreviaturas_from_persistent(self, grupo: str, long: int) -> Optional[Dict[str, str]]:
         """Obtiene abreviaturas desde caché persistente si está actualizada."""
@@ -613,22 +564,20 @@ class ByteInterface:
             "mtime": current_mtime,
             "abbr": abbr
         }
-        self._save_persistent_cache()
+        self._save_abbr_to_registry()
 
     def update_all_abbreviations(self) -> None:
         """Fuerza la actualización de la caché de abreviaturas para todos los grupos."""
+        self._persistent_cache = {}
         grupos = self.storage.get_grupos()
         for grupo in grupos:
             evs = self.storage.get_eventos(grupo)
             abbr = self.calc_abreviaturas(evs, 2)
             self._save_abbr_to_persistent(grupo, abbr)
-        # También limpiamos la caché en memoria para que la próxima vez se recargue desde persistente
         self._cache_abbr.clear()
 
     def _get_abreviaturas(self, grupo: str, long: int) -> Dict[str, str]:
         """Retorna abreviaturas para un grupo, usando caché persistente y en memoria."""
-        # Solo soportamos long=2 para eventos (el único lugar donde se usa)
-        # Para grupos se usa calc_abreviaturas directamente.
         if long != 2:
             # Fallback al cálculo directo
             evs = self.storage.get_eventos(grupo)
@@ -638,21 +587,18 @@ class ByteInterface:
         # Primero, intentar desde caché persistente
         persistent_abbr = self._get_abreviaturas_from_persistent(grupo, long)
         if persistent_abbr is not None:
-            # Actualizar caché en memoria
             self._cache_abbr[key] = persistent_abbr
             return persistent_abbr
 
         # No hay caché válida, calcular
         evs = self.storage.get_eventos(grupo)
         abbr = self.calc_abreviaturas(evs, long)
-        # Guardar en persistente
         self._save_abbr_to_persistent(grupo, abbr)
-        # Guardar en caché en memoria
         self._cache_abbr[key] = abbr
         return abbr
 
     def invalidar_cache_abreviaturas(self, grupo: Optional[str] = None) -> None:
-        """Invalida la caché de abreviaturas de un grupo o de todos (tanto en memoria como persistente)."""
+        """Invalida la caché de abreviaturas de un grupo o de todos."""
         if grupo is None:
             self._persistent_cache.clear()
             self._cache_abbr.clear()
@@ -660,9 +606,8 @@ class ByteInterface:
             keys_to_del = [k for k in self._cache_abbr if k[0] == grupo]
             for k in keys_to_del:
                 del self._cache_abbr[k]
-            # También eliminar de persistente
             self._persistent_cache.pop(grupo, None)
-        self._save_persistent_cache()
+        self._save_abbr_to_registry()
 
     def leer(self, prompt: str) -> str:
         try:
@@ -672,21 +617,28 @@ class ByteInterface:
             sys.exit(0)
 
     def calc_abreviaturas(self, lista: List[str], long: int) -> Dict[str, str]:
-        abbr = {}
-        usados: Set[str] = set()
-        for item in lista:
-            for i in range(len(item) - long + 1):
-                sub = item[i:i+long]
-                if sub not in usados:
-                    abbr[item] = sub
-                    usados.add(sub)
+        """Calcula abreviaturas únicas de longitud variable para cada elemento."""
+        max_long = max(long, 5)
+        resultado = {}
+        ordenados = sorted(lista, key=len)
+        for item in ordenados:
+            encontrado = None
+            for l in range(long, max_long + 1):
+                if len(item) < l:
+                    continue
+                for i in range(len(item) - l + 1):
+                    sub = item[i:i+l]
+                    if sub not in resultado.values():
+                        encontrado = sub
+                        break
+                if encontrado:
                     break
+            if encontrado:
+                resultado[item] = encontrado
             else:
-                for i in range(len(item) - long + 1):
-                    sub = item[i:i+long]
-                    abbr[item] = sub
-                    break
-        return abbr
+                resultado[item] = item[:max_long]
+        final = {item: resultado[item] for item in lista}
+        return final
 
     def render_ruta(self, grupo: str, stem: str) -> str:
         g_abbr = self.calc_abreviaturas(self.storage.get_grupos(), 3)
@@ -780,10 +732,13 @@ class ByteInterface:
             return
 
         term_width = shutil.get_terminal_size().columns
+        grupos_lista = grupos
+        g_abbr_tmp = self.calc_abreviaturas(grupos_lista, 3)
+        g_abbr = {g: g_abbr_tmp.get(g, g[:3] if len(g) >= 3 else g) for g in grupos_lista}
 
         def ancho_grupo(grupo: str, evs: List[str]) -> int:
             e_abbr = self._get_abreviaturas(grupo, 2)
-            header = f"{_resaltar(grupo, None, 3, C('group'), C('bold'))} {C('date')}({len(evs)}){C('rst')}"
+            header = f"{_resaltar(grupo, g_abbr.get(grupo), 3, C('group'), C('bold'))} {C('date')}({len(evs)}){C('rst')}"
             max_ancho = len(strip_ansi(header))
             for stem in evs:
                 ev_path = self.storage.get_evento_path(grupo, stem)
@@ -807,7 +762,7 @@ class ByteInterface:
             for (grupo, evs), ancho in zip(fila_grupos, fila_anchos):
                 col_w = ancho - 2
                 e_abbr = self._get_abreviaturas(grupo, 2)
-                header = f"{_resaltar(grupo, None, 3, C('group'), C('bold'))} {C('date')}({len(evs)}){C('rst')}"
+                header = f"{_resaltar(grupo, g_abbr.get(grupo), 3, C('group'), C('bold'))} {C('date')}({len(evs)}){C('rst')}"
                 lineas = [header]
                 for stem in evs:
                     ev_path = self.storage.get_evento_path(grupo, stem)
@@ -836,8 +791,8 @@ class ByteInterface:
 
         d = C("date")
         r = C("rst")
-        # Para grupos no cacheamos (son pocos)
-        g_abbr = self.calc_abreviaturas(grupos, 3)
+        g_abbr_tmp = self.calc_abreviaturas(grupos, 3)
+        g_abbr = {g: g_abbr_tmp.get(g, g[:3] if len(g)>=3 else g) for g in grupos}
 
         for gi, grupo in enumerate(grupos):
             evs = self.storage.get_eventos(grupo)
@@ -853,6 +808,11 @@ class ByteInterface:
             e_abbr = self._get_abreviaturas(grupo, 2)
             for stem in evs:
                 ev_path = self.storage.get_evento_path(grupo, stem)
+                # Verificar duplicados y forzar recálculo si es necesario
+                abbr_val = e_abbr.get(stem)
+                if abbr_val and list(e_abbr.values()).count(abbr_val) > 1:
+                    self.invalidar_cache_abreviaturas(grupo)
+                    e_abbr = self._get_abreviaturas(grupo, 2)
                 line = self._render_evento_linea(grupo, stem, ev_path, e_abbr, compact=False)
                 if show_dates:
                     mt = self.storage.mtime(ev_path)
@@ -1019,7 +979,6 @@ class ByteApp:
         # --- Manejo de archivos no cifrados (incluyendo binarios) ---
         if ev_path.is_file() and ev_path.suffix.lower() != ".gpg":
             tipo = self.storage.registry.get_type(grupo, stem)
-            # Si no hay tipo o es texto, verificar el tipo real ahora
             if not tipo or tipo == "text":
                 tipo_real = detectar_tipo_archivo(ev_path)
                 if tipo_real != "text":
@@ -1036,7 +995,6 @@ class ByteApp:
                 else:
                     print(f"{C('date')}Cancelado{C('rst')}")
                 return
-            # Si es texto, continúa (se abrirá editor más abajo)
 
         if texto is not None:
             if ev_path.suffix.lower() == ".gpg":
@@ -1057,14 +1015,12 @@ class ByteApp:
         if ev_path.suffix.lower() == ".gpg":
             try:
                 tmp = self.storage._gpg_decrypt_to_tmp(ev_path)
-                # Si no hay tipo registrado, detectar y guardar
                 if not self.storage.registry.get_type(grupo, stem):
                     tipo_real = detectar_tipo_archivo(tmp)
                     self.storage.registry.set_type(grupo, stem, tipo_real)
             except RuntimeError as e:
                 print(f"GPG error: {e}")
                 return
-            # Comprobar si el tipo registrado es binario (para evitar descifrar antes de preguntar)
             if self.storage.registry.get_type(grupo, stem) == "binary":
                 print(f"\n{C('date')}{ruta_fmt} es un archivo cifrado que contiene datos binarios (registrado).{C('rst')}")
                 op = self.ui.leer(f"¿Descifrar y exportar? (s/{C('date')}N{C('rst')}): ").lower()
@@ -1099,7 +1055,6 @@ class ByteApp:
                     print(f"{C('date')}Cancelado{C('rst')}")
                 tmp.unlink()
                 return
-            # Si no es binario, continúa con la edición normal (texto cifrado)
             mtime_antes = tmp.stat().st_mtime
             os.system(f'{self.config.editor} "{tmp}"')
             if tmp.stat().st_mtime != mtime_antes:
@@ -1632,7 +1587,6 @@ class ByteApp:
             print(f"  {d}Nota: para cifrar por primera vez se usa la configuración de byte.toml.{r}")
             print(f"  {d}Para añadir destinatarios a un archivo ya cifrado, vuelve a ejecutar byte g.{r}")
 
-        # Asegurar que el tipo del archivo original esté registrado antes de cifrar
         if ev_path and ev_path.is_file() and ev_path.suffix.lower() != ".gpg":
             tipo_actual = self.storage.registry.get_type(grupo, stem)
             if not tipo_actual or tipo_actual == "text":
@@ -1741,11 +1695,10 @@ class ByteApp:
         tipo_cambiado = False
         for g in self.storage.get_grupos():
             for stem in self.storage.get_eventos(g):
-                ev_path = self.storage.get_evento_path(g, stem)  # puede ser .gpg o no
+                ev_path = self.storage.get_evento_path(g, stem)
                 if not ev_path:
                     continue
                 if ev_path.suffix.lower() == ".gpg":
-                    # Los cifrados los trataremos más adelante en la sección de enlaces
                     continue
                 tipo_reg = self.storage.registry.get_type(g, stem)
                 tipo_real = detectar_tipo_archivo(ev_path)
@@ -1765,17 +1718,13 @@ class ByteApp:
             for stem in self.storage.get_eventos(g):
                 ev_path = self.storage.get_evento_path(g, stem)
                 for o in self.storage.registry.get_origins(g, stem):
-                    # Si el evento no existe físicamente (ev_path es None), igual procesamos el origen
-                    # pero luego habrá que manejar el caso
                     if not ev_path:
-                        # No existe el archivo del evento, pero el origen está registrado -> inconsistencia
                         continue
                     candidatos.append((g, stem, ev_path, o["path"], o["copy"]))
 
         if not candidatos:
             if not tipo_cambiado:
                 print(f"{d}No hay enlaces registrados.{r}")
-            # Aún así actualizamos la caché de abreviaturas
             self.ui.update_all_abbreviations()
             print(f"{d}Caché de abreviaturas actualizada (sin enlaces).{r}")
             return
@@ -1794,7 +1743,6 @@ class ByteApp:
                 print(f"{d}{g}/{stem} → origen no disponible: {self.ui._fmt_origin(origin_str)} (omitido){r}")
                 continue
 
-            # Para archivos cifrados, desciframos a temporal para comparar
             if ev_path.suffix.lower() == ".gpg":
                 contenido_ev = self.storage.leer_evento(g, stem)
                 if contenido_ev is None:
@@ -1883,8 +1831,6 @@ class ByteApp:
 
         for g, stem, ev_path, src, es_copia in salientes:
             if not es_copia:
-                # Para copias, si el evento cambió y es copia, se puede sincronizar evento->origen
-                # Para hardlinks, el cambio se refleja automáticamente (mismo inodo), así que no se maneja aquí.
                 continue
             if ev_path.suffix.lower() == ".gpg":
                 contenido_ev = self.storage.leer_evento(g, stem)
@@ -1931,7 +1877,6 @@ class ByteApp:
                     break
 
         print(f"{d}Revisión completada.{r}")
-        # Actualizar la caché de abreviaturas para reflejar cambios externos
         self.ui.update_all_abbreviations()
         print(f"{d}Caché de abreviaturas actualizada.{r}")
 
@@ -2113,7 +2058,6 @@ class ByteApp:
                 tokens.append(f"{g}/{e}")
         print(" ".join(tokens))
 
-    # Mostrar ayuda (sin cambios relevantes para columnas, pero se puede añadir una línea)
     def mostrar_ayuda(self) -> None:
         h = C("header")
         t = C("tree")
