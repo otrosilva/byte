@@ -2,9 +2,7 @@
 
 Gestor de eventos tipo log, byte es basado en bit.py.
 
-Pendiente:
-- [ ] Actualizar README.md
-- [ ] A futuro integrar en byte.py
+`bit help` # para obtener ayuda. 
 
 # byte.py
 
