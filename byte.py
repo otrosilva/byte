@@ -69,6 +69,7 @@ class Config:
     DEFAULT_EDITOR = os.environ.get("MICRO_EDITOR") or os.environ.get("EDITOR", "micro")
 
     def __init__(self):
+        """Inicializa la app con la configuración, crea storage e interfaz."""
         self.base: Path = self.DEFAULT_BASE
         self.editor: str = self.DEFAULT_EDITOR
         self.gpg_key: str = ""
@@ -78,17 +79,20 @@ class Config:
         self._load()
 
     def _load_toml_file(self, path: Path) -> Dict[str, Any]:
+        """Carga y parsea un archivo TOML, devuelve dict vacío si no existe o no hay parser."""
         if not path.is_file() or tomllib is None:
             return {}
         with open(path, "rb") as f:
             return tomllib.load(f)
 
     def _create_default_config(self, path: Path) -> None:
+        """Crea un archivo byte.toml por defecto en la ruta indicada."""
         path.parent.mkdir(parents=True, exist_ok=True)
         contenido = f'base   = "{self.DEFAULT_BASE}"\neditor = "{self.DEFAULT_EDITOR}"\ngpg_key = ""\ngpg_keys_secondary = []\ncolumnas = false\n'
         path.write_text(contenido, encoding="utf-8")
 
     def _load(self) -> None:
+        """Carga byte.json en memoria, o crea estructura por defecto si no existe."""
         system_path = Path.home() / ".config" / "byte" / "byte.toml"
         cfg = self._load_toml_file(system_path)
         if cfg:
@@ -120,6 +124,7 @@ class Config:
                 self.columnas_default = False
 
     def save(self, base: Path, editor: str, gpg_key: str, gpg_keys_secondary: List[str]) -> None:
+        """Guarda la configuración actual en el archivo byte.toml (usado por cmd_config)."""
         system_path = Path.home() / ".config" / "byte" / "byte.toml"
         target = system_path if system_path.is_file() else self.base / ".byte" / "byte.toml"
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -152,12 +157,14 @@ EXT_TEXTO = {
 # ============================================================================
 
 def _diff_tool() -> Optional[str]:
+    """Devuelve 'delta' o 'bat' si están instalados, sino None."""
     for tool in ("delta", "bat"):
         if shutil.which(tool):
             return tool
     return None
 
 def mostrar_diff(a: Path, b: Path) -> None:
+    """Muestra las diferencias entre dos archivos usando diff -u y opcionalmente delta/bat."""
     tool = _diff_tool()
     a_str, b_str = str(a), str(b)
     # Obtener el diff
@@ -180,6 +187,7 @@ def mostrar_diff(a: Path, b: Path) -> None:
         print(r.stdout, end="")
 
 def calcular_md5(path: Path) -> str:
+    """Calcula el hash MD5 de un archivo (usado para comparar binarios)."""
     hash_md5 = hashlib.md5()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(8192), b""):
@@ -187,6 +195,7 @@ def calcular_md5(path: Path) -> str:
     return hash_md5.hexdigest()
 
 def detectar_tipo_archivo(path: Path) -> str:
+    """Determina si un archivo es texto (UTF-8) o binario leyendo los primeros 1024 bytes."""
     try:
         with open(path, "r", encoding="utf-8") as f:
             f.read(1024)
@@ -195,6 +204,7 @@ def detectar_tipo_archivo(path: Path) -> str:
         return "binary"
 
 def _resaltar(texto: str, abrev: Optional[str], long: int, color_norm: str, color_res: str) -> str:
+    """Resalta una subcadena (abreviatura) dentro del texto con colores ANSI."""
     if not abrev:
         return color_norm + texto + C("rst")
     idx = texto.find(abrev)
@@ -211,12 +221,14 @@ def _resaltar(texto: str, abrev: Optional[str], long: int, color_norm: str, colo
 
 class Registry:
     def __init__(self, base: Path):
+        """Inicializa la app con la configuración, crea storage e interfaz."""
         self.path = base / ".byte" / "byte.json"
         self._data = None
         self._mtime: float = 0.0
         self._load()
 
     def _load(self) -> None:
+        """Carga byte.json en memoria, o crea estructura por defecto si no existe."""
         if not self.path.is_file():
             self._data = self._default_data()
             self._mtime = 0.0
@@ -232,19 +244,23 @@ class Registry:
             self._data = self._default_data()
 
     def _save(self) -> None:
+        """Guarda los datos en byte.json."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.path, "w", encoding="utf-8") as f:
             json.dump(self._data, f, indent=2, ensure_ascii=False)
         self._mtime = self.path.stat().st_mtime
 
     def _default_data(self):
+        """Estructura inicial del registro."""
         return {"links": {}, "info": {}, "gpg": {}, "abbr_cache": {}}
 
     def _key(self, grupo: str, stem: str) -> str:
+        """Genera la clave compuesta 'grupo/stem' para las entradas del registro."""
         return f"{grupo}/{stem}"
 
     # --- links ---
     def add_origin(self, grupo: str, stem: str, ruta: Path, es_copia: bool = False) -> None:
+        """Registra un archivo externo como origen para un evento."""
         self._load()
         key = self._key(grupo, stem)
         entry = {"path": str(ruta), "copy": es_copia}
@@ -255,6 +271,7 @@ class Registry:
             self._save()
 
     def remove_origin(self, grupo: str, stem: str, ruta: Path) -> None:
+        """Elimina un origen específico del registro (archivos externos intactos)."""
         self._load()
         key = self._key(grupo, stem)
         if key in self._data["links"]:
@@ -264,16 +281,19 @@ class Registry:
             self._save()
 
     def remove_all_origins(self, grupo: str, stem: str) -> None:
+        """Elimina todos los orígenes registrados para un evento."""
         self._load()
         key = self._key(grupo, stem)
         self._data["links"].pop(key, None)
         self._save()
 
     def get_origins(self, grupo: str, stem: str) -> List[Dict[str, Any]]:
+        """Devuelve la lista de orígenes registrados para un evento."""
         self._load()
         return self._data["links"].get(self._key(grupo, stem), [])
 
     def rename_links(self, g_src: str, s_src: str, g_dst: str, s_dst: str) -> None:
+        """Actualiza la clave de los orígenes al renombrar un evento."""
         self._load()
         key_src = self._key(g_src, s_src)
         key_dst = self._key(g_dst, s_dst)
@@ -283,11 +303,13 @@ class Registry:
 
     # --- info ---
     def get_info(self, grupo: str, stem: str) -> Optional[str]:
+        """Devuelve la nota corta asociada a un evento."""
         self._load()
         entry = self._data["info"].get(self._key(grupo, stem))
         return entry.get("info") if isinstance(entry, dict) else None
 
     def get_type(self, grupo: str, stem: str) -> str:
+        """Devuelve el tipo (text o binary) registrado para un evento."""
         self._load()
         entry = self._data["info"].get(self._key(grupo, stem))
         if isinstance(entry, dict) and "type" in entry:
@@ -295,6 +317,7 @@ class Registry:
         return "text"
 
     def set_info(self, grupo: str, stem: str, texto: str) -> None:
+        """Guarda o actualiza la nota corta de un evento."""
         self._load()
         key = self._key(grupo, stem)
         if key not in self._data["info"] or not isinstance(self._data["info"][key], dict):
@@ -303,6 +326,7 @@ class Registry:
         self._save()
 
     def set_type(self, grupo: str, stem: str, tipo: str) -> None:
+        """Registra el tipo (text o binary) de un evento."""
         self._load()
         key = self._key(grupo, stem)
         if key not in self._data["info"] or not isinstance(self._data["info"][key], dict):
@@ -311,15 +335,18 @@ class Registry:
         self._save()
 
     def has_info(self, grupo: str, stem: str) -> bool:
+        """Indica si el evento tiene una nota asociada."""
         return self.get_info(grupo, stem) is not None
 
     def remove_info(self, grupo: str, stem: str) -> None:
+        """Elimina la nota de un evento."""
         self._load()
         key = self._key(grupo, stem)
         self._data["info"].pop(key, None)
         self._save()
 
     def rename_info(self, g_src: str, s_src: str, g_dst: str, s_dst: str) -> None:
+        """Actualiza la clave de la nota al renombrar un evento."""
         self._load()
         key_src = self._key(g_src, s_src)
         key_dst = self._key(g_dst, s_dst)
@@ -329,24 +356,29 @@ class Registry:
 
     # --- gpg ---
     def mark_gpg(self, grupo: str, stem: str, key_id: str) -> None:
+        """Marca un evento como cifrado con GPG y guarda la(s) clave(s) destinatario."""
         self._load()
         self._data["gpg"][self._key(grupo, stem)] = key_id
         self._save()
 
     def unmark_gpg(self, grupo: str, stem: str) -> None:
+        """Elimina la marca GPG de un evento (el archivo ya no está cifrado)."""
         self._load()
         self._data["gpg"].pop(self._key(grupo, stem), None)
         self._save()
 
     def is_protected(self, grupo: str, stem: str) -> bool:
+        """Indica si un evento está marcado como cifrado."""
         self._load()
         return self._key(grupo, stem) in self._data["gpg"]
 
     def key_id(self, grupo: str, stem: str) -> Optional[str]:
+        """Devuelve la(s) clave(s) GPG asociadas a un evento cifrado."""
         self._load()
         return self._data["gpg"].get(self._key(grupo, stem))
 
     def rename_gpg(self, g_src: str, s_src: str, g_dst: str, s_dst: str) -> None:
+        """Actualiza la clave GPG al renombrar un evento cifrado."""
         self._load()
         key_src = self._key(g_src, s_src)
         key_dst = self._key(g_dst, s_dst)
@@ -356,9 +388,11 @@ class Registry:
 
     # --- abbr_cache (persistente) ---
     def get_abbr_cache(self) -> Dict[str, Dict]:
+        """Obtiene la caché de abreviaturas (por grupo) desde el registro."""
         return self._data.get("abbr_cache", {})
 
     def set_abbr_cache(self, abbr_cache: Dict[str, Dict]) -> None:
+        """Guarda la caché de abreviaturas en el registro."""
         self._data["abbr_cache"] = abbr_cache
         self._save()
 
@@ -368,16 +402,19 @@ class Registry:
 
 class ByteStorage:
     def __init__(self, base: Path):
+        """Inicializa la app con la configuración, crea storage e interfaz."""
         self.base = base
         self.byte_dir = base / ".byte"
         self.registry = Registry(base)
         self._dir_cache: Dict[str, Tuple[float, List[Path]]] = {}
 
     def asegurar_base(self) -> None:
+        """Crea el directorio base y .byte si no existen."""
         self.base.mkdir(parents=True, exist_ok=True)
         self.byte_dir.mkdir(parents=True, exist_ok=True)
 
     def _listar_grupo(self, grupo: str) -> List[Path]:
+        """Devuelve la lista de rutas de archivos dentro de un grupo, con caché."""
         gp = self.base / grupo
         if not gp.is_dir():
             self._dir_cache[grupo] = (0.0, [])
@@ -392,21 +429,26 @@ class ByteStorage:
         return self._dir_cache[grupo][1]
 
     def _invalidar_cache_grupo(self, grupo: str) -> None:
+        """Invalida la caché del directorio de un grupo."""
         self._dir_cache.pop(grupo, None)
 
     def normalize(self, txt: str) -> str:
+        """Normaliza texto a minúsculas sin diacríticos."""
         txt = txt.lower()
         return "".join(c for c in unicodedata.normalize("NFKD", txt) if unicodedata.category(c) != "Mn")
 
     def titulo(self, txt: str) -> str:
+        """Capitaliza la primera letra de un string."""
         return txt.strip().capitalize()
 
     def get_grupos(self) -> List[str]:
+        """Devuelve la lista de grupos (directorios) dentro de la base."""
         if not self.base.is_dir():
             return []
         return sorted(d.name for d in self.base.iterdir() if d.is_dir() and not d.name.startswith("."))
 
     def get_eventos(self, grupo: str) -> List[str]:
+        """Devuelve los stems de los archivos en un grupo."""
         stems = []
         for f in self._listar_grupo(grupo):
             ext = f.suffix.lower()
@@ -425,6 +467,7 @@ class ByteStorage:
         return unicos
 
     def get_evento_path(self, grupo: str, stem: str) -> Optional[Path]:
+        """Devuelve la ruta completa del archivo de un evento."""
         for f in self._listar_grupo(grupo):
             ext = f.suffix.lower()
             if ext == ".gpg":
@@ -435,12 +478,15 @@ class ByteStorage:
         return None
 
     def grupo_path(self, grupo: str) -> Path:
+        """Devuelve la ruta del directorio de un grupo."""
         return self.base / self.titulo(grupo)
 
     def evento_path(self, grupo: str, stem: str, ext: str = ".md") -> Path:
+        """Devuelve la ruta esperada de un evento (sin verificar existencia)."""
         return self.base / self.titulo(grupo) / f"{stem}{ext}"
 
     def trash(self, path: Path) -> None:
+        """Mueve un archivo o directorio a .trash con una marca de tiempo."""
         if not path.exists():
             return
         trash_dir = self.base / ".trash"
@@ -449,17 +495,20 @@ class ByteStorage:
         shutil.move(path, dest)
 
     def mtime(self, path: Optional[Path]) -> Optional[datetime]:
+        """Devuelve la fecha de modificación de un archivo o None."""
         if not path or not path.is_file():
             return None
         return datetime.fromtimestamp(path.stat().st_mtime)
 
     def limpiar_vacios(self) -> None:
+        """Elimina directorios de grupos vacíos."""
         for g in self.get_grupos():
             gp = self.grupo_path(g)
             if gp.is_dir() and not any(f for f in gp.iterdir() if not f.name.startswith(".")):
                 gp.rmdir()
 
     def leer_evento(self, grupo: str, stem: str) -> Optional[bytes]:
+        """Lee el contenido completo de un evento (descifrando si es .gpg)."""
         path = self.get_evento_path(grupo, stem)
         if not path or not path.is_file():
             return None
@@ -475,6 +524,7 @@ class ByteStorage:
 
     def escribir_evento(self, grupo: str, stem: str, contenido: bytes,
                         key_id: Optional[str] = None, cifrar: bool = True) -> None:
+        """Escribe contenido en un evento (cifrando si está protegido)."""
         ev_path = self.get_evento_path(grupo, stem)
         if cifrar:
             if key_id is None:
@@ -501,6 +551,7 @@ class ByteStorage:
         self._invalidar_cache_grupo(grupo)
 
     def _gpg_encrypt(self, plain_path: Path, key_id: str, output_path: Path) -> None:
+        """Cifra un archivo plano con GPG usando la(s) clave(s) indicada(s)."""
         keys = [k.strip() for k in key_id.split(",") if k.strip()] if "," in key_id else [key_id]
         out = output_path if output_path.suffix == ".gpg" else output_path.with_suffix(output_path.suffix + ".gpg")
         cmd = ["gpg", "--yes", "--batch", "--trust-model", "always"]
@@ -514,6 +565,7 @@ class ByteStorage:
             out.rename(output_path)
 
     def _gpg_decrypt_to_tmp(self, path: Path) -> Path:
+        """Descifra un archivo .gpg a un archivo temporal."""
         inner_ext = Path(path.stem).suffix or ".bin"
         tmp = tempfile.NamedTemporaryFile(suffix=inner_ext, delete=False)
         tmp.close()
@@ -533,6 +585,7 @@ class ByteStorage:
 
 class ByteInterface:
     def __init__(self, storage: ByteStorage):
+        """Inicializa la app con la configuración, crea storage e interfaz."""
         self.storage = storage
         self.registry = storage.registry
         self._cache_abbr: Dict[Tuple[str, int], Dict[str, str]] = {}
@@ -614,6 +667,7 @@ class ByteInterface:
         self._save_abbr_to_registry()
 
     def leer(self, prompt: str) -> str:
+        """Lee una línea de entrada del usuario, maneja Ctrl+C / Ctrl+D."""
         try:
             return input(prompt).strip()
         except (KeyboardInterrupt, EOFError):
@@ -645,6 +699,7 @@ class ByteInterface:
         return final
 
     def render_ruta(self, grupo: str, stem: str) -> str:
+        """Renderiza una ruta grupo/evento con abreviaturas resaltadas."""
         g_abbr = self.calc_abreviaturas(self.storage.get_grupos(), 3)
         g_render = _resaltar(grupo, g_abbr.get(grupo), 3, C("group"), C("bold"))
         evs = self.storage.get_eventos(grupo)
@@ -655,6 +710,7 @@ class ByteInterface:
         return f"{g_render}{C('tree')}/{C('rst')}{e_render}"
 
     def _fmt_origin(self, path_str: str) -> str:
+        """Abrevia una ruta larga mostrando solo los dos últimos componentes."""
         p = Path(path_str)
         parts = p.parts
         if len(parts) >= 2:
@@ -662,6 +718,7 @@ class ByteInterface:
         return path_str
 
     def _get_badges_compactos(self, grupo: str, stem: str) -> str:
+        """Devuelve los 4 caracteres de estado (g,i,enlace,b) para modo columnas."""
         c = []
         if self.storage.registry.is_protected(grupo, stem):
             c.append(f"{C('warn')}g{C('rst')}")
@@ -694,6 +751,7 @@ class ByteInterface:
 
     def _render_evento_linea(self, grupo: str, stem: str, ev_path: Optional[Path],
                              e_abbr: Dict[str, str], compact: bool = False) -> str:
+        """Renderiza una línea del árbol para un evento."""
         event_render = _resaltar(stem, e_abbr.get(stem), 2, C("event"), C("bold"))
         ext_str = ""
         if ev_path and ev_path.suffix.lower() != ".gpg":
@@ -730,6 +788,7 @@ class ByteInterface:
             return f"{display_name}{badges}{origins_str}"
 
     def print_arbol_columnas(self, show_dates: bool = False) -> None:
+        """Imprime el árbol en formato de columnas compactas."""
         grupos = self.storage.get_grupos()
         if not grupos:
             print("  (vacío)")
@@ -785,6 +844,7 @@ class ByteInterface:
 
     def print_arbol(self, grupos_filter: Optional[List[str]] = None, show_dates: bool = False,
                     column_mode: bool = False) -> None:
+        """Imprime el árbol de notas (modo normal o columnas)."""
         if column_mode:
             self.print_arbol_columnas(show_dates)
             return
@@ -826,6 +886,7 @@ class ByteInterface:
         print()
 
     def pedir_grupo(self, label: str = "Grupo") -> str:
+        """Solicita al usuario un nombre de grupo (puede ser abreviatura)."""
         grupos = self.storage.get_grupos()
         self.print_arbol()
         while True:
@@ -846,6 +907,7 @@ class ByteInterface:
             return self.storage.titulo(res)
 
     def pedir_evento(self, grupo: str, label: str = "Evento") -> str:
+        """Solicita al usuario un nombre de evento dentro de un grupo (puede ser abreviatura)."""
         evs = self.storage.get_eventos(grupo)
         if evs:
             e_abbr = self._get_abreviaturas(grupo, 2)
@@ -876,12 +938,14 @@ class ByteInterface:
 
 class ByteApp:
     def __init__(self, config: Config):
+        """Inicializa la app con la configuración, crea storage e interfaz."""
         self.config = config
         self.storage = ByteStorage(config.base)
         self.ui = ByteInterface(self.storage)
 
     # --- resolución de argumentos ---
     def find_grupo(self, token: str) -> Optional[str]:
+        """Busca un grupo por nombre completo o abreviatura de 3 letras."""
         grupos = self.storage.get_grupos()
         if token in grupos:
             return token
@@ -897,6 +961,7 @@ class ByteApp:
         return None
 
     def parse_arg(self, arg: str) -> Tuple[Optional[str], Optional[str]]:
+        """Parsea un argumento 'grupo/evento' o 'grupo.evento' y resuelve abreviaturas."""
         if not arg:
             return None, None
         # Acepta separador '/' o '.'
@@ -927,6 +992,7 @@ class ByteApp:
         return None, arg
 
     def resolver_arg(self, arg: str) -> Tuple[Optional[str], Optional[str]]:
+        """Resuelve un token a (grupo, evento) buscando en todos los grupos y usando abreviaturas."""
         g, e = self.parse_arg(arg)
         if g and e:
             return g, e
@@ -953,6 +1019,7 @@ class ByteApp:
 
     # --- comandos ---
     def cmd_open(self, args: List[str]) -> None:
+        """Comando por defecto: abre evento en editor o añade línea con timestamp."""
         if not sys.stdout.isatty() and len(args) == 1:
             token = args[0]
             grupo, stem = self.resolver_arg(token)
@@ -1151,6 +1218,7 @@ class ByteApp:
                 self.storage.registry.set_type(grupo, stem, "text")
 
     def cmd_link(self, args: List[str]) -> None:
+        """Registra un archivo externo como origen (siempre copia, nunca hardlink)."""
         if not args:
             archivo = self.ui.leer("Archivo a enlazar: ")
             if not archivo:
@@ -1170,7 +1238,7 @@ class ByteApp:
                 grupo_hint = g_res
                 stem_override = e_res
             else:
-                # Si no se puede resolver, tratar como nombre directo (puede contener extensión)
+                # Si no se puede resolver, tratar como nombre directo
                 if "/" in segundo:
                     partes = segundo.split("/", 1)
                     grupo_hint = self.find_grupo(partes[0]) or self.storage.titulo(partes[0])
@@ -1245,7 +1313,7 @@ class ByteApp:
                 print("  Error al leer el evento")
                 return
             src.write_bytes(contenido)
-            self.storage.registry.add_origin(grupo, stem, src, es_copia=True)
+            self.storage.registry.add_origin(grupo, stem, src, es_copia=True)   # siempre copia
             tipo = self.storage.registry.get_type(grupo, stem)
             if tipo == "text":
                 tipo = detectar_tipo_archivo(ev_path)
@@ -1261,14 +1329,10 @@ class ByteApp:
             if self.ui.leer(f"  Crear {grupo}/{stem} desde {src}? (s/{C('date')}N{C('rst')}): ").lower() != 's':
                 return
             ev_path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                os.link(src, ev_path)
-                metodo = "hardlink"
-                es_copia = False
-            except OSError:
-                shutil.copy2(src, ev_path)
-                metodo = "copia"
-                es_copia = True
+            # Siempre copia, nunca hardlink
+            shutil.copy2(src, ev_path)
+            metodo = "copia"
+            es_copia = True
             self.storage.registry.add_origin(grupo, stem, src, es_copia=es_copia)
             tipo = detectar_tipo_archivo(src)
             self.storage.registry.set_type(grupo, stem, tipo)
@@ -1305,7 +1369,7 @@ class ByteApp:
                 contenido = src.read_bytes()
                 key_id = self.storage.registry.key_id(grupo, stem) if self.storage.registry.is_protected(grupo, stem) else None
                 self.storage.escribir_evento(grupo, stem, contenido, key_id=key_id, cifrar=bool(key_id))
-                self.storage.registry.add_origin(grupo, stem, src, es_copia=False)
+                self.storage.registry.add_origin(grupo, stem, src, es_copia=False)   # aquí origen → vault, no es copia
                 tipo = detectar_tipo_archivo(src)
                 self.storage.registry.set_type(grupo, stem, tipo)
                 print(f"{C('plus')}✓ {self.ui.render_ruta(grupo, stem)} actualizado desde {src}{C('rst')}")
@@ -1320,6 +1384,7 @@ class ByteApp:
         print(f"{C('minus')}  Ni el archivo externo ni el evento existen. Nada que hacer.{C('rst')}")
         
     def cmd_unlink(self, args: List[str]) -> None:
+        """Elimina el registro de un origen (archivos intactos)."""
         if not args:
             enlazados = []
             for g in self.storage.get_grupos():
@@ -1384,6 +1449,7 @@ class ByteApp:
                     print("  Número inválido.")
 
     def cmd_del(self, args: List[str]) -> None:
+        """Envía un grupo o evento a la papelera (.trash)."""
         entrada = args[0] if args else self.ui.leer("Borrar Grupo/ o evento: ")
         if not entrada:
             print("Cancelado.")
@@ -1423,6 +1489,7 @@ class ByteApp:
         self.storage.limpiar_vacios()
 
     def _renombrar(self, grupo: str, origen: str, destino: str) -> None:
+        """Renombra un evento dentro del mismo grupo."""
         p_src = self.storage.get_evento_path(grupo, origen)
         if not p_src:
             print(f"No existe: {grupo}/{origen}")
@@ -1450,6 +1517,7 @@ class ByteApp:
         print(f"{C('plus')}✓ Renombrado: {grupo}/{origen} → {grupo}/{destino}{C('rst')}")
 
     def _mover(self, g_src: str, e_src: str, g_dest: str, e_dest: str) -> None:
+        """Mueve un evento a otro grupo (posiblemente renombrando)."""
         p_src = self.storage.get_evento_path(g_src, e_src)
         if not p_src or not p_src.is_file():
             print(f"No existe: {g_src}/{e_src}")
@@ -1486,6 +1554,7 @@ class ByteApp:
         print(f"{C('plus')}✓ Movido: {r_src} ➔ {r_dest}{C('rst')}")
 
     def _fusionar(self, g_dest: str, e_dest: str, g_src: str, e_src: str) -> None:
+        """Fusiona el contenido de un evento en otro (con separador ---)."""
         if g_src == g_dest and e_src == e_dest:
             print(f"{C('warn')}No se puede fusionar un evento consigo mismo.{C('rst')}")
             return
@@ -1530,6 +1599,7 @@ class ByteApp:
         print(f"{C('plus')}✓ Fusionado: {r_src} ➔ {r_dest}{C('rst')}")
 
     def cmd_mv(self, args: List[str]) -> None:
+        """Mueve o fusiona eventos (comando --mv)."""
         if not args:
             self.ui.print_arbol()
             opcion = self.ui.leer("¿[m]over o [f]usionar? (m/f): ").lower()
@@ -1590,6 +1660,7 @@ class ByteApp:
             self._mover(g_origen, e_origen, g_dest, e_dest)
 
     def cmd_gpg(self, args: List[str]) -> None:
+        """Cifra un evento con GPG usando la clave primaria/secundarias."""
         if not shutil.which("gpg"):
             print("gpg no está disponible en el sistema.")
             return
@@ -1714,6 +1785,7 @@ class ByteApp:
         print(f"{C('plus')}~ {ruta_fmt}{r}  {w}g{r} {prim_fmt}{sec_fmt}")
 
     def cmd_nogpg(self, args: List[str]) -> None:
+        """Descifra un evento y elimina la protección GPG."""
         if not shutil.which("gpg"):
             print("gpg no está disponible en el sistema.")
             return
@@ -1758,6 +1830,7 @@ class ByteApp:
         print(f"{C('plus')}~ {self.ui.render_ruta(grupo, stem)}{C('rst')} (descifrado, sin protección GPG)")
 
     def cmd_check(self, args: List[str]) -> None:
+        """Verifica tipos, enlaces, actualiza caché y sincroniza copias (bidireccional)."""
         c = C("header")
         d = C("date")
         r = C("rst")
@@ -1769,6 +1842,7 @@ class ByteApp:
             print(f"Archivo de configuración: {cfg_display}")
         else:
             print("Archivo de configuración: (ninguno, usando por defecto)")
+        # Mostrar base con ~ si está en home
         base_display = str(self.storage.base).replace(str(Path.home()), "~")
         print(f"Directorio: {base_display}")
         print(f"Editor: {self.config.editor}")
@@ -1851,6 +1925,7 @@ class ByteApp:
             else:
                 salientes.append((g, stem, ev_path, src, es_copia))
 
+        # Procesar cambios donde el origen es más reciente o hay diferencias
         for g, stem, ev_path, src, es_gpg, es_copia in cambios_entrantes:
             if not es_copia:
                 continue
@@ -1860,6 +1935,10 @@ class ByteApp:
             print(f"\n{C('bold')}{ruta_fmt}{r}{gpg_tag}"
                   f"  {C('link')}c → {origen_fmt}{r}"
                   f"  {d}(modificado){r}")
+            # Mostrar fechas de modificación
+            mtime_ev = datetime.fromtimestamp(ev_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            mtime_src = datetime.fromtimestamp(src.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            print(f"  {d}evento: {mtime_ev}  |  origen: {mtime_src}{r}")
 
             es_binario_origen = detectar_tipo_archivo(src) == "binary"
             es_binario_evento = not es_gpg and self.storage.registry.get_type(g, stem) == "binary"
@@ -1937,6 +2016,7 @@ class ByteApp:
                     print(f"{d}  Omitido{r}")
                     break
 
+        # Procesar cambios donde el evento (vault) es más reciente (o diferentes)
         for g, stem, ev_path, src, es_copia in salientes:
             if not es_copia:
                 continue
@@ -1955,6 +2035,10 @@ class ByteApp:
             print(f"\n{C('bold')}{ruta_fmt}{r}"
                   f"  {C('link')}c → {origen_fmt}{r}"
                   f"  {d}(modificado){r}")
+            # Mostrar fechas de modificación
+            mtime_ev = datetime.fromtimestamp(ev_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            mtime_src = datetime.fromtimestamp(src.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            print(f"  {d}evento: {mtime_ev}  |  origen: {mtime_src}{r}")
 
             es_binario_evento = self.storage.registry.get_type(g, stem) == "binary"
 
@@ -2021,6 +2105,7 @@ class ByteApp:
         print(f"{d}Caché de abreviaturas actualizada.{r}")
 
     def cmd_info(self, args: List[str]) -> None:
+        """Muestra o asigna una nota corta a un evento."""
         if not args:
             encontrado = False
             for g in self.storage.get_grupos():
@@ -2099,6 +2184,7 @@ class ByteApp:
             print(f"  {badges} {ruta_fmt}: {C('date')}{nota}{C('rst')}")
 
     def cmd_config(self, args: List[str]) -> None:
+        """Configura interactivamente la base, editor, GPG y vista por columnas."""
         c = C("bold")
         r = C("rst")
         d = C("date")
@@ -2191,6 +2277,7 @@ class ByteApp:
             print(f"{d}Cancelado{r}")
 
     def cmd_complete(self, args: List[str]) -> None:
+        """Genera lista de grupos/eventos para autocompletado de shell."""
         tokens = []
         for g in self.storage.get_grupos():
             tokens.append(f"{g}/")
@@ -2199,6 +2286,7 @@ class ByteApp:
         print(" ".join(tokens))
 
     def mostrar_ayuda(self) -> None:
+        """Muestra la ayuda del programa."""
         h = C("header")
         t = C("tree")
         d = C("date")
@@ -2237,6 +2325,7 @@ class ByteApp:
 # ============================================================================
 
 def main() -> None:
+    """Punto de entrada: configura, parsea argumentos y ejecuta el comando correspondiente."""
     config = Config()
     app = ByteApp(config)
     app.storage.asegurar_base()
