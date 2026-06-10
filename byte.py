@@ -831,8 +831,9 @@ class ByteInterface:
             if res in grupos:
                 return res
             g_abbr = self.calc_abreviaturas(grupos, 3)
+            res_lower = res.lower()
             for g, ab in g_abbr.items():
-                if ab == res:
+                if ab.lower() == res_lower:
                     return g
             res_norm = self.storage.normalize(res)
             for g in grupos:
@@ -881,8 +882,9 @@ class ByteApp:
         if token in grupos:
             return token
         g_abbr = self.ui.calc_abreviaturas(grupos, 3)
+        token_lower = token.lower()
         for g, ab in g_abbr.items():
-            if ab == token:
+            if ab.lower() == token_lower:
                 return g
         token_norm = self.storage.normalize(token)
         for g in grupos:
@@ -893,12 +895,28 @@ class ByteApp:
     def parse_arg(self, arg: str) -> Tuple[Optional[str], Optional[str]]:
         if not arg:
             return None, None
-        m = re.match(r"^([^/]+)/(.+)$", arg)
+        # Acepta separador '/' o '.'
+        m = re.match(r"^([^/.]+)[/.](.+)$", arg)
         if m:
             g_raw, ev_raw = m.group(1), m.group(2)
             grupo = self.find_grupo(g_raw) or self.storage.titulo(g_raw)
-            ev_stem = Path(ev_raw).stem if Path(ev_raw).suffix in EXT_TEXTO | {".gpg"} else ev_raw
-            return grupo, ev_stem
+            if grupo is None:
+                return None, ev_raw
+            # Obtener el nombre base del evento (sin extensión)
+            ev_base = Path(ev_raw).stem
+            # 1. Buscar si ev_base es una abreviatura válida en este grupo
+            e_abbr = self.ui._get_abreviaturas(grupo, 2)
+            for ev, ab in e_abbr.items():
+                if ab.lower() == ev_base.lower():
+                    return grupo, ev
+            # 2. Buscar si ev_base es un nombre real (normalizado)
+            evs = self.storage.get_eventos(grupo)
+            ev_norm = self.storage.normalize(ev_base)
+            for ev in evs:
+                if self.storage.normalize(ev) == ev_norm:
+                    return grupo, ev
+            # 3. Si no, devolver el grupo y el nombre base (podría ser un evento nuevo)
+            return grupo, ev_base
         m = re.match(r"^([^/]+)/$", arg)
         if m:
             return self.find_grupo(m.group(1)) or self.storage.titulo(m.group(1)), None
@@ -976,6 +994,68 @@ class ByteApp:
         if ev_path is None:
             ev_path = self.storage.evento_path(grupo, stem, ext=".md")
 
+        # --- NUEVO: Añadir línea con timestamp (si hay texto) ---
+        if texto and texto.strip():
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+            linea_con_fecha = f"{timestamp} {texto}\n"
+
+            # Caso 1: el evento no existe
+            if not ev_path.is_file():
+                ev_path.parent.mkdir(parents=True, exist_ok=True)
+                ev_path.write_text(linea_con_fecha, encoding="utf-8")
+                self.storage.registry.set_type(grupo, stem, "text")
+                print(f"{C('plus')}+ {self.ui.render_ruta(grupo, stem)} {C('tree')}│{C('rst')} {linea_con_fecha.strip()}")
+                return
+
+            # Caso 2: existe y es .gpg (cifrado)
+            if ev_path.suffix.lower() == ".gpg":
+                tipo = self.storage.registry.get_type(grupo, stem)
+                if tipo == "binary":
+                    print(f"{C('warn')}No se puede añadir texto a un archivo cifrado binario.{C('rst')}")
+                    return
+                if tipo != "text":
+                    print(f"{C('warn')}El archivo cifrado no tiene tipo registrado como texto. Use 'byte check' para actualizar.{C('rst')}")
+                    return
+                try:
+                    tmp = self.storage._gpg_decrypt_to_tmp(ev_path)
+                except RuntimeError as e:
+                    print(f"GPG error: {e}")
+                    return
+                try:
+                    contenido_actual = tmp.read_text(encoding="utf-8")
+                except UnicodeDecodeError:
+                    print(f"{C('warn')}El contenido descifrado no es texto UTF-8. No se puede añadir línea.{C('rst')}")
+                    tmp.unlink()
+                    return
+                nuevo_contenido = contenido_actual + linea_con_fecha
+                tmp.write_text(nuevo_contenido, encoding="utf-8")
+                key_id = self.storage.registry.key_id(grupo, stem)
+                if not key_id:
+                    print(f"{C('warn')}No hay clave GPG registrada para este evento.{C('rst')}")
+                    tmp.unlink()
+                    return
+                try:
+                    self.storage._gpg_encrypt(tmp, key_id, ev_path)
+                except Exception as e:
+                    print(f"Error al cifrar: {e}")
+                finally:
+                    tmp.unlink()
+                print(f"{C('plus')}~ {self.ui.render_ruta(grupo, stem)} {C('tree')}│{C('rst')} {linea_con_fecha.strip()}")
+                return
+
+            # Caso 3: existe y no es .gpg
+            tipo_real = detectar_tipo_archivo(ev_path)
+            if tipo_real == "binary":
+                print(f"{C('warn')}No se puede añadir texto a un archivo binario.{C('rst')}")
+                return
+            # Es texto, añadir al final
+            with open(ev_path, "a", encoding="utf-8") as f:
+                f.write(linea_con_fecha)
+            print(f"{C('plus')}~ {self.ui.render_ruta(grupo, stem)} {C('tree')}│{C('rst')} {linea_con_fecha.strip()}")
+            return
+        # --- FIN del bloque de añadir línea con timestamp ---
+
+        # --- A partir de aquí, comportamiento original cuando NO hay texto (abrir editor) ---
         # --- Manejo de archivos no cifrados (incluyendo binarios) ---
         if ev_path.is_file() and ev_path.suffix.lower() != ".gpg":
             tipo = self.storage.registry.get_type(grupo, stem)
@@ -995,19 +1075,7 @@ class ByteApp:
                 else:
                     print(f"{C('date')}Cancelado{C('rst')}")
                 return
-
-        if texto is not None:
-            if ev_path.suffix.lower() == ".gpg":
-                print(f"{C('warn')}No se puede añadir texto a un archivo cifrado.{C('rst')}")
-                return
-            es_nuevo = not ev_path.is_file()
-            contenido_actual = self.storage.leer_evento(grupo, stem) or b""
-            nuevo = contenido_actual + texto.encode() + b"\n"
-            key_id = self.storage.registry.key_id(grupo, stem) if self.storage.registry.is_protected(grupo, stem) else None
-            self.storage.escribir_evento(grupo, stem, nuevo, key_id=key_id, cifrar=bool(key_id))
-            accion = "+" if es_nuevo else "~"
-            print(f"{C('plus')}{accion} {self.ui.render_ruta(grupo, stem)} {C('tree')}│{C('rst')} {texto}")
-            return
+            # Si es texto, continúa (se abrirá editor más abajo)
 
         ruta_fmt = self.ui.render_ruta(grupo, stem)
         es_nuevo = not ev_path.is_file()
@@ -1021,6 +1089,7 @@ class ByteApp:
             except RuntimeError as e:
                 print(f"GPG error: {e}")
                 return
+            # Si el tipo registrado es binario, preguntar exportar sin descifrar antes (ya está descifrado en tmp)
             if self.storage.registry.get_type(grupo, stem) == "binary":
                 print(f"\n{C('date')}{ruta_fmt} es un archivo cifrado que contiene datos binarios (registrado).{C('rst')}")
                 op = self.ui.leer(f"¿Descifrar y exportar? (s/{C('date')}N{C('rst')}): ").lower()
@@ -1028,16 +1097,13 @@ class ByteApp:
                     inner_ext = Path(ev_path.stem).suffix or ".bin"
                     default_name = f"{stem}{inner_ext}"
                     destino = Path.cwd() / default_name
-                    resp = self.ui.leer(f"Destino [{destino}]: ")
-                    if resp:
-                        destino = Path(resp).expanduser()
-                    destino.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(tmp, destino)
-                    print(f"{C('plus')}✓ Descifrado y exportado a {destino}{C('rst')}")
+                    print(f"{C('plus')}✓ Exportado a {destino}{C('rst')}")
                 else:
                     print(f"{C('date')}Cancelado{C('rst')}")
                 tmp.unlink()
                 return
+            # Si no hay tipo o es texto pero al detectar es binario (fallback)
             if detectar_tipo_archivo(tmp) == "binary":
                 print(f"\n{C('date')}{ruta_fmt} es un archivo cifrado que contiene datos binarios.{C('rst')}")
                 op = self.ui.leer(f"¿Descifrar y exportar? (s/{C('date')}N{C('rst')}): ").lower()
@@ -1045,16 +1111,13 @@ class ByteApp:
                     inner_ext = Path(ev_path.stem).suffix or ".bin"
                     default_name = f"{stem}{inner_ext}"
                     destino = Path.cwd() / default_name
-                    resp = self.ui.leer(f"Destino [{destino}]: ")
-                    if resp:
-                        destino = Path(resp).expanduser()
-                    destino.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(tmp, destino)
-                    print(f"{C('plus')}✓ Descifrado y exportado a {destino}{C('rst')}")
+                    print(f"{C('plus')}✓ Exportado a {destino}{C('rst')}")
                 else:
                     print(f"{C('date')}Cancelado{C('rst')}")
                 tmp.unlink()
                 return
+            # Es texto cifrado: abrir editor
             mtime_antes = tmp.stat().st_mtime
             os.system(f'{self.config.editor} "{tmp}"')
             if tmp.stat().st_mtime != mtime_antes:
@@ -1070,6 +1133,7 @@ class ByteApp:
                 print(f"{C('date')}  (sin cambios){C('rst')}")
             return
 
+        # Archivo normal (no cifrado)
         ev_path.parent.mkdir(parents=True, exist_ok=True)
         ev_path.touch()
         os.system(f'{self.config.editor} "{ev_path}"')
