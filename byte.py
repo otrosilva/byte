@@ -1681,7 +1681,6 @@ class ByteApp:
                 capture_output=True,
                 text=True
             )
-            # Si el código de retorno es 0 y la salida contiene "pub" o "uid", la clave existe
             return result.returncode == 0 and ("pub" in result.stdout or "uid" in result.stdout)
         except Exception:
             return False
