@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
 # byte.py — gestor de notas Markdown y archivos binarios (Linux/macOS)
+# Con comandos de versionado: byte version|v <evento> [mensaje]
+#                           byte restore|r <evento> [número|timestamp]
+#                           byte info <evento> muestra versiones disponibles
+# Las versiones se guardan en la ruta configurable 'versions_path' en byte.toml
 
 import os
 import sys
@@ -67,6 +71,7 @@ def pad_ansi(s: str, width: int) -> str:
 class Config:
     DEFAULT_BASE = Path.home() / "Documentos/Filen/Obsidian/bytes"
     DEFAULT_EDITOR = os.environ.get("MICRO_EDITOR") or os.environ.get("EDITOR", "micro")
+    DEFAULT_VERSIONS_PATH = Path.home() / ".config" / "byte" / "versions"
 
     def __init__(self):
         self.base: Path = self.DEFAULT_BASE
@@ -76,6 +81,7 @@ class Config:
         self.used_config_path: Optional[Path] = None
         self.columnas_default: bool = False
         self.search_encrypted: bool = False
+        self.versions_path: Path = self.DEFAULT_VERSIONS_PATH
         self._load()
 
     def _load_toml_file(self, path: Path) -> Dict[str, Any]:
@@ -86,7 +92,7 @@ class Config:
 
     def _create_default_config(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        contenido = f'base   = "{self.DEFAULT_BASE}"\neditor = "{self.DEFAULT_EDITOR}"\ngpg_key = ""\ngpg_keys_secondary = []\ncolumnas = false\nsearch_encrypted = false\n'
+        contenido = f'base   = "{self.DEFAULT_BASE}"\neditor = "{self.DEFAULT_EDITOR}"\ngpg_key = ""\ngpg_keys_secondary = []\ncolumnas = false\nsearch_encrypted = false\nversions_path = "{self.DEFAULT_VERSIONS_PATH}"\n'
         path.write_text(contenido, encoding="utf-8")
 
     def _load(self) -> None:
@@ -122,8 +128,14 @@ class Config:
             self.search_encrypted = cfg.get("search_encrypted", False)
             if not isinstance(self.search_encrypted, bool):
                 self.search_encrypted = False
+            raw_versions = cfg.get("versions_path")
+            if raw_versions:
+                self.versions_path = Path(raw_versions).expanduser().resolve()
+            else:
+                self.versions_path = self.DEFAULT_VERSIONS_PATH
 
-    def save(self, base: Path, editor: str, gpg_key: str, gpg_keys_secondary: List[str], columnas: bool, search_encrypted: bool) -> None:
+    def save(self, base: Path, editor: str, gpg_key: str, gpg_keys_secondary: List[str], 
+             columnas: bool, search_encrypted: bool, versions_path: Path) -> None:
         system_path = Path.home() / ".config" / "byte" / "byte.toml"
         target = system_path if system_path.is_file() else self.base / ".byte" / "byte.toml"
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -133,6 +145,7 @@ class Config:
         lines.append(f'gpg_keys_secondary = [{", ".join(f"\"{k}\"" for k in gpg_keys_secondary)}]' if gpg_keys_secondary else 'gpg_keys_secondary = []')
         lines.append(f'columnas = {str(columnas).lower()}')
         lines.append(f'search_encrypted = {str(search_encrypted).lower()}')
+        lines.append(f'versions_path = "{versions_path}"')
         target.write_text("\n".join(lines) + "\n", encoding="utf-8")
         self.base = base
         self.editor = editor
@@ -140,6 +153,7 @@ class Config:
         self.gpg_keys_secondary = gpg_keys_secondary
         self.columnas_default = columnas
         self.search_encrypted = search_encrypted
+        self.versions_path = versions_path
         self.used_config_path = target
 
 # ============================================================================
@@ -486,12 +500,14 @@ class ByteStorage:
         self.base = base
         self.byte_dir = base / ".byte"
         self.registry = Registry(base, config)
+        self.versions_path = config.versions_path
         self._dir_cache: Dict[str, Tuple[float, List[Path]]] = {}
 
     def asegurar_base(self) -> None:
         self.base.mkdir(parents=True, exist_ok=True)
         self.byte_dir.mkdir(parents=True, exist_ok=True)
         (Path.home() / ".config" / "byte").mkdir(parents=True, exist_ok=True)
+        self.versions_path.mkdir(parents=True, exist_ok=True)
 
     def _listar_grupo(self, grupo: str) -> List[Path]:
         gp = self.base / grupo
@@ -643,14 +659,61 @@ class ByteStorage:
             raise RuntimeError(res.stderr.decode())
         return tmp_path
 
+    # --- VERSIONADO (guardado en versions_path configurable) ---
+    def guardar_version(self, grupo: str, stem: str) -> Optional[Path]:
+        """Copia el archivo actual al directorio de versiones."""
+        ev_path = self.get_evento_path(grupo, stem)
+        if not ev_path or not ev_path.is_file():
+            return None
+        version_dir = self.versions_path / grupo / stem
+        version_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ext = ev_path.suffix
+        version_path = version_dir / f"{timestamp}{ext}"
+        shutil.copy2(ev_path, version_path)
+        return version_path
+
+    def listar_versiones(self, grupo: str, stem: str) -> List[Path]:
+        """Devuelve lista de rutas de versiones ordenadas por fecha (más reciente primero)."""
+        version_dir = self.versions_path / grupo / stem
+        if not version_dir.is_dir():
+            return []
+        pattern = re.compile(r'^\d{8}_\d{6}\.[^.]+$')
+        files = [f for f in version_dir.iterdir() if f.is_file() and pattern.match(f.name)]
+        files.sort(key=lambda p: p.name, reverse=True)
+        return files
+
+    def restaurar_version(self, grupo: str, stem: str, version_path: Path) -> bool:
+        """Sobrescribe el archivo actual con la versión elegida."""
+        if not version_path.is_file():
+            return False
+        ev_path = self.get_evento_path(grupo, stem)
+        if not ev_path:
+            ev_path = self.evento_path(grupo, stem, ext=version_path.suffix)
+        contenido = version_path.read_bytes()
+        key_id = self.registry.key_id(grupo, stem) if self.registry.is_protected(grupo, stem) else None
+        self.escribir_evento(grupo, stem, contenido, key_id=key_id, cifrar=bool(key_id))
+        return True
+
+    def parsear_timestamp(self, s: str) -> Optional[datetime]:
+        """Intenta parsear un timestamp parcial o completo."""
+        if re.match(r'^\d{8}_\d{6}$', s):
+            return datetime.strptime(s, "%Y%m%d_%H%M%S")
+        if re.match(r'^\d{8}$', s):
+            return datetime.strptime(s, "%Y%m%d")
+        if re.match(r'^\d{6}$', s):
+            return datetime.strptime(s, "%Y%m")
+        return None
+
 # ============================================================================
 # INTERFAZ (con caché de abreviaturas dentro de byte.json)
 # ============================================================================
 
 class ByteInterface:
-    def __init__(self, storage: ByteStorage):
+    def __init__(self, storage: ByteStorage, columnas_default: bool = False):
         self.storage = storage
         self.registry = storage.registry
+        self.columnas_default = columnas_default
         self._cache_abbr: Dict[Tuple[str, int], Dict[str, str]] = {}
         self._load_abbr_from_registry()
 
@@ -932,9 +995,12 @@ class ByteInterface:
                 print(f"  {line}")
         print()
 
-    def pedir_grupo(self, label: str = "Grupo") -> str:
-        grupos = self.storage.get_grupos()
-        self.print_arbol()
+    def pedir_grupo(self, label: str = "Grupo", mostrar_arbol: bool = True) -> str:
+        if mostrar_arbol:
+            grupos = self.storage.get_grupos()
+            self.print_arbol(column_mode=self.columnas_default)
+        else:
+            grupos = self.storage.get_grupos()
         while True:
             res = self.leer(f"{label}: ")
             if not res:
@@ -985,7 +1051,7 @@ class ByteApp:
     def __init__(self, config: Config):
         self.config = config
         self.storage = ByteStorage(config.base, config)
-        self.ui = ByteInterface(self.storage)
+        self.ui = ByteInterface(self.storage, config.columnas_default)
 
     # --- resolución de argumentos ---
     def find_grupo(self, token: str) -> Optional[str]:
@@ -1059,7 +1125,7 @@ class ByteApp:
             grupo, stem = self.resolver_arg(token)
             if not grupo:
                 stem = token
-                grupo = self.ui.pedir_grupo(f"Grupo para '{stem}'")
+                grupo = self.ui.pedir_grupo(f"Grupo para '{stem}'", mostrar_arbol=True)
                 if not grupo:
                     return
             if not stem:
@@ -1074,7 +1140,7 @@ class ByteApp:
             return
 
         if not args:
-            grupo = self.ui.pedir_grupo()
+            grupo = self.ui.pedir_grupo(mostrar_arbol=True)
             if not grupo:
                 return
             stem = self.ui.pedir_evento(grupo)
@@ -1087,7 +1153,7 @@ class ByteApp:
             grupo, stem = self.resolver_arg(token)
             if not grupo:
                 stem = Path(token).stem if Path(token).suffix in EXT_TEXTO | {".gpg"} else token
-                grupo = self.ui.pedir_grupo(f"Grupo para '{stem}'")
+                grupo = self.ui.pedir_grupo(f"Grupo para '{stem}'", mostrar_arbol=True)
                 if not grupo:
                     return
             if not stem:
@@ -1270,15 +1336,17 @@ class ByteApp:
             src_exists = remote_exists(src_str)
             src_parent = None
         else:
+            # Convertir a ruta absoluta y resolver symlinks
             src = Path(src_str).expanduser().resolve()
             src_exists = src.is_file()
             src_parent = src.parent
+            src_str = str(src)  # Ahora es absoluta
 
         if grupo_hint:
             grupo = grupo_hint
         else:
-            self.ui.print_arbol()
-            grupo = self.ui.pedir_grupo("Grupo para el evento (puede ser abreviatura)")
+            self.ui.print_arbol(column_mode=self.ui.columnas_default)
+            grupo = self.ui.pedir_grupo("Grupo para el evento (puede ser abreviatura)", mostrar_arbol=False)
             if not grupo:
                 return
 
@@ -1301,19 +1369,21 @@ class ByteApp:
                 else:
                     stem = stem_override
                     if not es_remoto(src_str):
-                        if src.suffix and src.suffix.lower() in EXT_TEXTO:
-                            ext = src.suffix.lower()
+                        src_path = Path(src_str)
+                        if src_path.suffix and src_path.suffix.lower() in EXT_TEXTO:
+                            ext = src_path.suffix.lower()
                         else:
-                            ext = src.suffix if src.suffix else ""
+                            ext = src_path.suffix if src_path.suffix else ""
                     else:
                         ext = p_override.suffix if p_override.suffix else ".bin"
         else:
             if not es_remoto(src_str):
-                stem = src.stem
-                if src.suffix and src.suffix.lower() in EXT_TEXTO:
-                    ext = src.suffix.lower()
+                src_path = Path(src_str)
+                stem = src_path.stem
+                if src_path.suffix and src_path.suffix.lower() in EXT_TEXTO:
+                    ext = src_path.suffix.lower()
                 else:
-                    ext = src.suffix if src.suffix else ""
+                    ext = src_path.suffix if src_path.suffix else ""
             else:
                 remote_path = remote_parse(src_str)[1]
                 stem = Path(remote_path).stem
@@ -1324,11 +1394,12 @@ class ByteApp:
         if not ev_exists:
             if not ext:
                 if not es_remoto(src_str):
-                    tipo = detectar_tipo_archivo(src)
+                    src_path = Path(src_str)
+                    tipo = detectar_tipo_archivo(src_path)
                     if tipo == "text":
                         ext = ".md"
                     else:
-                        ext = src.suffix if src.suffix else ".bin"
+                        ext = src_path.suffix if src_path.suffix else ".bin"
                 else:
                     ext = ".bin"
             ev_path = self.storage.evento_path(grupo, stem, ext=ext)
@@ -1360,7 +1431,7 @@ class ByteApp:
 
         if src_exists and not ev_exists:
             print(f"{C('date')}  El evento {grupo}/{stem} no existe, se creará desde el archivo externo.{C('rst')}")
-            prompt_src = src_str if es_remoto(src_str) else str(src)
+            prompt_src = src_str if es_remoto(src_str) else str(Path(src_str))
             if self.ui.leer(f"  Crear {grupo}/{stem} desde {prompt_src}? (s/{C('date')}N{C('rst')}): ").lower() != 's':
                 return
             ev_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1382,7 +1453,7 @@ class ByteApp:
                 else:
                     ext = ev_path.suffix if ev_path.suffix else ".bin"
             else:
-                shutil.copy2(src, ev_path)
+                shutil.copy2(Path(src_str), ev_path)
                 metodo = "copia"
             self.storage.registry.add_origin(grupo, stem, src_str)
             tipo = detectar_tipo_archivo(ev_path)
@@ -1539,7 +1610,7 @@ class ByteApp:
             if not gp.is_dir():
                 print(f"No existe el grupo '{grupo}'")
                 return
-            self.ui.print_arbol([grupo])
+            self.ui.print_arbol([grupo], column_mode=self.ui.columnas_default)
             if self.ui.leer(f"Enviar al trash '{grupo}/'? (s/{C('date')}N{C('rst')}): ") == "s":
                 for ev in self.storage.get_eventos(grupo):
                     p = self.storage.get_evento_path(grupo, ev)
@@ -1549,22 +1620,138 @@ class ByteApp:
                         self.storage.registry.unmark_gpg(grupo, ev)
                 self.storage.trash(gp)
                 print(f"Enviado al trash: {grupo}/")
-        else:
-            if not grupo or not stem:
-                print(f"No encontrado: '{entrada}'")
-                return
-            ev_path = self.storage.get_evento_path(grupo, stem)
-            if not ev_path or not ev_path.is_file():
-                print(f"No existe {grupo}/{stem}")
-                return
-            ruta_fmt = self.ui.render_ruta(grupo, stem)
+            return
+
+        if not grupo or not stem:
+            print(f"No encontrado: '{entrada}'")
+            return
+
+        ev_path = self.storage.get_evento_path(grupo, stem)
+        if not ev_path or not ev_path.is_file():
+            print(f"No existe {grupo}/{stem}")
+            return
+
+        # Verificar si hay versiones
+        versiones = self.storage.listar_versiones(grupo, stem)
+        ruta_fmt = self.ui.render_ruta(grupo, stem)
+
+        if not versiones:
+            # Comportamiento normal: borrar evento directamente
             if self.ui.leer(f"Enviar al trash {grupo}/{ev_path.name}? (s/{C('date')}N{C('rst')}): ") == "s":
                 self.storage.registry.remove_all_origins(grupo, stem)
                 self.storage.registry.remove_info(grupo, stem)
                 self.storage.registry.unmark_gpg(grupo, stem)
                 self.storage.trash(ev_path)
                 print(f"{C('minus')}- {ruta_fmt}{C('rst')}")
-        self.storage.limpiar_vacios()
+            self.storage.limpiar_vacios()
+            return
+
+        # Hay versiones: mostrar menú simplificado
+        print(f"\n{C('header')}El evento {ruta_fmt} tiene {len(versiones)} versiones guardadas.{C('rst')}")
+        print("  [t] Borrar todo")
+        print("  [v] Borrar versiones individuales")
+        print("  [c] Cancelar")
+
+        op = self.ui.leer("  Elige opción (t/v/c): ").lower()
+
+        if op == 'c' or op == '':
+            print(f"{C('date')}Cancelado.{C('rst')}")
+            return
+
+        if op == 't':
+            # Borrar todo
+            if self.ui.leer(f"¿Eliminar definitivamente {ruta_fmt} y todas sus versiones? (s/{C('date')}N{C('rst')}): ").lower() == 's':
+                # Borrar versiones
+                version_dir = self.storage.versions_path / grupo / stem
+                if version_dir.is_dir():
+                    shutil.rmtree(version_dir)
+                # Borrar evento
+                self.storage.registry.remove_all_origins(grupo, stem)
+                self.storage.registry.remove_info(grupo, stem)
+                self.storage.registry.unmark_gpg(grupo, stem)
+                self.storage.trash(ev_path)
+                print(f"{C('minus')}- {ruta_fmt} (incluyendo versiones) eliminado{C('rst')}")
+                self.storage.limpiar_vacios()
+                # Limpiar directorio de versiones vacío
+                parent = version_dir.parent
+                if parent.is_dir() and not any(parent.iterdir()):
+                    parent.rmdir()
+            else:
+                print(f"{C('date')}Cancelado.{C('rst')}")
+
+        elif op == 'v':
+            # Borrar versiones individuales
+            if len(versiones) == 1:
+                # Solo una versión, preguntar directamente
+                version_path = versiones[0]
+                ts_str = version_path.stem
+                try:
+                    dt = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
+                    fecha = dt.strftime("%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    fecha = ts_str
+                if self.ui.leer(f"  ¿Eliminar la única versión ({fecha})? (s/{C('date')}N{C('rst')}): ").lower() == 's':
+                    try:
+                        version_path.unlink()
+                        print(f"{C('minus')}✓ Eliminada versión {fecha}{C('rst')}")
+                        # Limpiar directorio si queda vacío
+                        version_dir = version_path.parent
+                        if version_dir.is_dir() and not any(version_dir.iterdir()):
+                            version_dir.rmdir()
+                            parent = version_dir.parent
+                            if parent.is_dir() and not any(parent.iterdir()):
+                                parent.rmdir()
+                    except Exception as e:
+                        print(f"{C('warn')}Error al eliminar la versión: {e}{C('rst')}")
+                else:
+                    print(f"{C('date')}Cancelado.{C('rst')}")
+            else:
+                # Múltiples versiones: mostrar lista y elegir
+                print(f"\n{C('header')}Versiones disponibles:{C('rst')}")
+                for i, vpath in enumerate(versiones, 1):
+                    ts_str = vpath.stem
+                    try:
+                        dt = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
+                        fecha = dt.strftime("%Y-%m-%d %H:%M:%S")
+                    except ValueError:
+                        fecha = ts_str
+                    print(f"  [{i}] {C('date')}{fecha}{C('rst')}  ({vpath.name})")
+                print()
+                seleccion = self.ui.leer("  Elige número a eliminar (o 'c' cancelar): ")
+                if seleccion.lower() == 'c' or seleccion == '':
+                    print(f"{C('date')}Cancelado.{C('rst')}")
+                    return
+                if seleccion.isdigit():
+                    idx = int(seleccion) - 1
+                    if 0 <= idx < len(versiones):
+                        version_path = versiones[idx]
+                        ts_str = version_path.stem
+                        try:
+                            dt = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
+                            fecha = dt.strftime("%Y-%m-%d %H:%M:%S")
+                        except ValueError:
+                            fecha = ts_str
+                        if self.ui.leer(f"  ¿Eliminar versión {fecha}? (s/{C('date')}N{C('rst')}): ").lower() == 's':
+                            try:
+                                version_path.unlink()
+                                print(f"{C('minus')}✓ Eliminada versión {fecha}{C('rst')}")
+                                # Limpiar directorio si queda vacío
+                                version_dir = version_path.parent
+                                if version_dir.is_dir() and not any(version_dir.iterdir()):
+                                    version_dir.rmdir()
+                                    parent = version_dir.parent
+                                    if parent.is_dir() and not any(parent.iterdir()):
+                                        parent.rmdir()
+                            except Exception as e:
+                                print(f"{C('warn')}Error al eliminar la versión: {e}{C('rst')}")
+                        else:
+                            print(f"{C('date')}Cancelado.{C('rst')}")
+                    else:
+                        print(f"{C('warn')}Índice inválido.{C('rst')}")
+                else:
+                    print(f"{C('warn')}Opción no válida.{C('rst')}")
+        else:
+            print(f"{C('warn')}Opción no válida.{C('rst')}")
 
     def _renombrar(self, grupo: str, origen: str, destino: str) -> None:
         p_src = self.storage.get_evento_path(grupo, origen)
@@ -1687,18 +1874,18 @@ class ByteApp:
 
     def cmd_mv(self, args: List[str]) -> None:
         if not args:
-            self.ui.print_arbol()
+            self.ui.print_arbol(column_mode=self.ui.columnas_default)
             opcion = self.ui.leer("¿[m]over o [f]usionar? (m/f): ").lower()
             if opcion == "f":
-                g_dest = self.ui.pedir_grupo("Grupo destino")
+                g_dest = self.ui.pedir_grupo("Grupo destino", mostrar_arbol=False)
                 e_dest = self.ui.pedir_evento(g_dest, "Evento destino")
-                g_src = self.ui.pedir_grupo("Grupo fuente")
+                g_src = self.ui.pedir_grupo("Grupo fuente", mostrar_arbol=False)
                 e_src = self.ui.pedir_evento(g_src, "Evento fuente")
                 self._fusionar(g_dest, e_dest, g_src, e_src)
             else:
-                g_src = self.ui.pedir_grupo("Grupo origen")
+                g_src = self.ui.pedir_grupo("Grupo origen", mostrar_arbol=False)
                 e_src = self.ui.pedir_evento(g_src, "Evento origen")
-                g_dest = self.ui.pedir_grupo("Grupo destino")
+                g_dest = self.ui.pedir_grupo("Grupo destino", mostrar_arbol=False)
                 nuevo = self.ui.leer(f"Nuevo nombre (Enter = '{e_src}'): ") or e_src
                 if g_src == g_dest and self.storage.normalize(e_src) == self.storage.normalize(nuevo) and e_src != nuevo:
                     self._renombrar(g_src, e_src, nuevo)
@@ -1751,7 +1938,7 @@ class ByteApp:
             return
 
         if not args:
-            self.ui.print_arbol()
+            self.ui.print_arbol(column_mode=self.ui.columnas_default)
             entrada = self.ui.leer("Evento: ")
             if not entrada:
                 return
@@ -1763,7 +1950,7 @@ class ByteApp:
         grupo, stem = self.resolver_arg(entrada)
         if not grupo:
             stem = entrada
-            grupo = self.ui.pedir_grupo(f"Grupo para '{stem}'")
+            grupo = self.ui.pedir_grupo(f"Grupo para '{stem}'", mostrar_arbol=False)
             if not grupo:
                 return
         if not stem:
@@ -1907,7 +2094,7 @@ class ByteApp:
             print("gpg no está disponible en el sistema.")
             return
         if not args:
-            self.ui.print_arbol()
+            self.ui.print_arbol(column_mode=self.ui.columnas_default)
             entrada = self.ui.leer("Evento a desproteger: ")
             if not entrada:
                 return
@@ -1916,7 +2103,7 @@ class ByteApp:
         grupo, stem = self.resolver_arg(entrada)
         if not grupo:
             stem = entrada
-            grupo = self.ui.pedir_grupo(f"Grupo para '{stem}'")
+            grupo = self.ui.pedir_grupo(f"Grupo para '{stem}'", mostrar_arbol=False)
             if not grupo:
                 return
         if not stem:
@@ -2331,6 +2518,20 @@ class ByteApp:
                     print()
                 for line in info_lines:
                     print(line)
+
+            # Mostrar versiones si existen
+            versiones = self.storage.listar_versiones(grupo, stem)
+            if versiones:
+                print(f"\n  {C('header')}Versiones disponibles:{C('rst')}")
+                for i, vpath in enumerate(versiones, 1):
+                    # Extraer timestamp del nombre del archivo
+                    ts_str = vpath.stem  # parte sin extensión
+                    try:
+                        dt = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
+                        fecha = dt.strftime("%Y-%m-%d %H:%M:%S")
+                    except ValueError:
+                        fecha = ts_str
+                    print(f"    [{i}] {C('date')}{fecha}{C('rst')}  ({vpath.name})")
             return
 
         evs = self.storage.get_eventos(grupo)
@@ -2343,7 +2544,9 @@ class ByteApp:
             txt = self.storage.registry.get_info(grupo, stem)
             nota = txt if txt else "(sin nota)"
             badges = self.ui._get_badges_compactos(grupo, stem)
-            print(f"  {badges} {ruta_fmt}: {C('date')}{nota}{C('rst')}")
+            versiones = self.storage.listar_versiones(grupo, stem)
+            ver_str = f" {C('date')}[{len(versiones)} versiones]{C('rst')}" if versiones else ""
+            print(f"  {badges} {ruta_fmt}: {C('date')}{nota}{C('rst')}{ver_str}")
 
     def cmd_config(self, args: List[str]) -> None:
         c = C("bold")
@@ -2415,12 +2618,18 @@ class ByteApp:
         resp_enc = self.ui.leer(f"¿Buscar también dentro de archivos cifrados? (s/{C('date')}N{C('rst')}): ").lower()
         nuevas_search_enc = resp_enc == "s"
 
+        # Nuevo: pedir ruta de versiones
+        versions_actual = str(self.config.versions_path)
+        resp = self.ui.leer(f"Ruta para versiones [{versions_actual}]: ")
+        nuevas_versions = Path(resp).expanduser().resolve() if resp else self.config.versions_path
+
         lines = [f'base   = "{nueva_base}"', f'editor = "{nuevo_editor}"']
         if nueva_primaria:
             lines.append(f'gpg_key = "{nueva_primaria}"')
         lines.append(f'gpg_keys_secondary = [{", ".join(f"\"{k}\"" for k in nuevas_sec)}]' if nuevas_sec else 'gpg_keys_secondary = []')
         lines.append(f'columnas = {str(nuevas_columnas).lower()}')
         lines.append(f'search_encrypted = {str(nuevas_search_enc).lower()}')
+        lines.append(f'versions_path = "{nuevas_versions}"')
         contenido = "\n".join(lines) + "\n"
         print(f"\n{d}--- byte.toml ---{r}")
         print(contenido)
@@ -2436,13 +2645,168 @@ class ByteApp:
             self.config.gpg_keys_secondary = nuevas_sec
             self.config.columnas_default = nuevas_columnas
             self.config.search_encrypted = nuevas_search_enc
+            self.config.versions_path = nuevas_versions
             self.config.used_config_path = target
             self.storage = ByteStorage(self.config.base, self.config)
-            self.ui = ByteInterface(self.storage)
-            if nueva_base != self.config.base:
-                print(f"{w}Cambio de BASE aplicado (recreado el storage).{r}")
+            self.ui = ByteInterface(self.storage, self.config.columnas_default)
+            if nueva_base != self.config.base or nuevas_versions != self.config.versions_path:
+                print(f"{w}Cambio de BASE o VERSIONS_PATH aplicado (recreado el storage).{r}")
         else:
             print(f"{d}Cancelado{r}")
+
+    # --- NUEVOS COMANDOS: version y restore ---
+    def cmd_version(self, args: List[str]) -> None:
+        """Crea una versión del evento actual."""
+        if not args:
+            self.ui.print_arbol(column_mode=self.ui.columnas_default)
+            entrada = self.ui.leer("Evento: ")
+            if not entrada:
+                return
+            mensaje = ""
+        else:
+            entrada = args[0]
+            mensaje = " ".join(args[1:]) if len(args) > 1 else ""
+
+        grupo, stem = self.resolver_arg(entrada)
+        if not grupo:
+            stem = entrada
+            grupo = self.ui.pedir_grupo(f"Grupo para '{stem}'", mostrar_arbol=False)
+            if not grupo:
+                return
+        if not stem:
+            stem = self.ui.pedir_evento(grupo, "Evento")
+            if not stem:
+                return
+
+        ev_path = self.storage.get_evento_path(grupo, stem)
+        if not ev_path or not ev_path.is_file():
+            print(f"{C('warn')}El evento {grupo}/{stem} no existe.{C('rst')}")
+            return
+
+        version_path = self.storage.guardar_version(grupo, stem)
+        if version_path:
+            ts_str = version_path.stem
+            try:
+                dt = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
+                fecha = dt.strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                fecha = ts_str
+            print(f"{C('plus')}✓ Versión guardada:{C('rst')}")
+            print(f"  {self.ui.render_ruta(grupo, stem)} → {C('date')}{fecha}{C('rst')}")
+            if mensaje:
+                print(f"  {C('date')}Mensaje: {mensaje}{C('rst')}")
+        else:
+            print(f"{C('warn')}Error al guardar la versión.{C('rst')}")
+
+    def cmd_restore(self, args: List[str]) -> None:
+        """Restaura una versión anterior del evento."""
+        if not args:
+            self.ui.print_arbol(column_mode=self.ui.columnas_default)
+            entrada = self.ui.leer("Evento: ")
+            if not entrada:
+                return
+            seleccion = ""
+        else:
+            entrada = args[0]
+            seleccion = args[1] if len(args) > 1 else ""
+
+        grupo, stem = self.resolver_arg(entrada)
+        if not grupo:
+            stem = entrada
+            grupo = self.ui.pedir_grupo(f"Grupo para '{stem}'", mostrar_arbol=False)
+            if not grupo:
+                return
+        if not stem:
+            stem = self.ui.pedir_evento(grupo, "Evento")
+            if not stem:
+                return
+
+        versiones = self.storage.listar_versiones(grupo, stem)
+        if not versiones:
+            print(f"{C('date')}No hay versiones disponibles para {grupo}/{stem}.{C('rst')}")
+            return
+
+        # Si se pasó un número o timestamp, intentar resolverlo
+        if seleccion:
+            # Si es un número, interpretar como índice (1 = más reciente)
+            if seleccion.isdigit():
+                idx = int(seleccion) - 1
+                if 0 <= idx < len(versiones):
+                    version_elegida = versiones[idx]
+                else:
+                    print(f"{C('warn')}Índice inválido. Hay {len(versiones)} versiones disponibles.{C('rst')}")
+                    return
+            else:
+                # Intentar parsear como timestamp parcial
+                dt = self.storage.parsear_timestamp(seleccion)
+                if dt:
+                    # Buscar la versión más cercana que coincida
+                    target_str = dt.strftime("%Y%m%d_%H%M%S")
+                    # Buscar por prefijo (si el usuario puso solo fecha)
+                    matching = [v for v in versiones if v.stem.startswith(seleccion)]
+                    if matching:
+                        version_elegida = matching[0]  # la más reciente que coincida
+                    else:
+                        print(f"{C('warn')}No se encontró versión con timestamp '{seleccion}'.{C('rst')}")
+                        return
+                else:
+                    print(f"{C('warn')}Selección inválida. Use un número o timestamp (ej. 20250320 o 20250320_143000).{C('rst')}")
+                    return
+        else:
+            # Mostrar lista y pedir selección
+            print(f"\n{C('header')}Versiones disponibles para {self.ui.render_ruta(grupo, stem)}:{C('rst')}")
+            for i, vpath in enumerate(versiones, 1):
+                ts_str = vpath.stem
+                try:
+                    dt = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
+                    fecha = dt.strftime("%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    fecha = ts_str
+                print(f"  [{i}] {C('date')}{fecha}{C('rst')}  ({vpath.name})")
+            print()
+            op = self.ui.leer("  Elige número (o 'd' para diff con actual, 'c' cancelar): ")
+            if op.lower() == 'c' or op == '':
+                print(f"{C('date')}Cancelado.{C('rst')}")
+                return
+            if op.lower() == 'd':
+                # Mostrar diff con el archivo actual y luego pedir de nuevo
+                ev_actual = self.storage.get_evento_path(grupo, stem)
+                if ev_actual and ev_actual.is_file():
+                    print(f"\n{C('header')}Diferencias entre actual y versiones:{C('rst')}")
+                    # Diff con la última versión (más reciente)
+                    mostrar_diff(ev_actual, versiones[0])
+                else:
+                    print(f"{C('warn')}No hay archivo actual para comparar.{C('rst')}")
+                # Volver a pedir selección después de diff
+                return self.cmd_restore([entrada])  # recursivo
+            if op.isdigit():
+                idx = int(op) - 1
+                if idx < 0 or idx >= len(versiones):
+                    print(f"{C('warn')}Índice inválido.{C('rst')}")
+                    return
+                version_elegida = versiones[idx]
+            else:
+                print(f"{C('warn')}Opción inválida.{C('rst')}")
+                return
+
+        # Confirmar restauración
+        ts_str = version_elegida.stem
+        try:
+            dt = datetime.strptime(ts_str, "%Y%m%d_%H%M%S")
+            fecha = dt.strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            fecha = ts_str
+        print(f"\n  Versión elegida: {C('date')}{fecha}{C('rst')}")
+        if self.ui.leer(f"  ¿Restaurar esta versión en {grupo}/{stem}? (s/{C('date')}N{C('rst')}): ").lower() != 's':
+            print(f"{C('date')}Cancelado.{C('rst')}")
+            return
+
+        if self.storage.restaurar_version(grupo, stem, version_elegida):
+            print(f"{C('plus')}✓ Restaurada versión {fecha} en {self.ui.render_ruta(grupo, stem)}{C('rst')}")
+            self.storage._invalidar_cache_grupo(grupo)
+            self.ui.invalidar_cache_abreviaturas(grupo)
+        else:
+            print(f"{C('warn')}Error al restaurar la versión.{C('rst')}")
 
     # --- Nuevo comando: search ---
     def cmd_search(self, args: List[str]) -> None:
@@ -2563,6 +2927,8 @@ class ByteApp:
         print(f"  {t}--check   {d}c{r}                      muestra configuración y sincroniza copias/enlaces")
         print(f"  {t}--config  {d}x{r}                      configuración inicial")
         print(f"  {t}--search  {d}s{r}  texto [grupo]       busca texto en eventos (usa rg/grep){r}")
+        print(f"  {t}--version {d}v{r}  evento {d}[mensaje]{r}  guarda una versión del archivo actual")
+        print(f"  {t}--restore {d}r{r}  evento {d}[número|timestamp]{r}  restaura una versión anterior (con diff)")
         print()
         print(f"  {h}Indicadores en el árbol normal (y en --columnas){r}")
         print(f"  {w}g{r} gpg   {d}b{r} binario   {w}i{r} info   {d}c →{r} copia   {d}r →{r} remoto   {d}x{r} enlace roto")
@@ -2607,6 +2973,8 @@ def main() -> None:
         "info": app.cmd_info, "gpg": app.cmd_gpg, "nogpg": app.cmd_nogpg,
         "check": app.cmd_check, "unlink": app.cmd_unlink, "config": app.cmd_config,
         "search": app.cmd_search,
+        "version": app.cmd_version, "v": app.cmd_version,
+        "restore": app.cmd_restore, "r": app.cmd_restore,
         "l": app.cmd_link, "d": app.cmd_del, "m": app.cmd_mv,
         "i": app.cmd_info, "g": app.cmd_gpg, "q": app.cmd_nogpg,
         "c": app.cmd_check, "u": app.cmd_unlink, "x": app.cmd_config,
