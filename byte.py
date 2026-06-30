@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 byte.py — gestor de notas Markdown y archivos binarios (Linux/macOS)
+v1.0
 """
 
 import os
@@ -27,36 +28,46 @@ except ImportError:
         import tomli as tomllib
     except ImportError:
         tomllib = None
+        
+__version__ = "1.0"
 
 # ============================================================================
 # COLORES ANSI
 # ============================================================================
+# Colores ANSI estándar (no de paleta de 256 fijos) para que se adapten
+# correctamente tanto a temas oscuros como claros de terminal.
 _ANSI = {
     "rst":    "\033[0m",
-    "bold":   "\033[1;37m",
-    "event":  "\033[0;37m",
-    "header": "\033[1;37m",
-    "plus":   "\033[1;37m",
-    "minus":  "\033[38;5;167m",
-    "tree":   "\033[38;5;238m",
-    "group":  "\033[38;5;250m",
-    "count":  "\033[1;37m",
-    "date":   "\033[38;5;243m",
-    "link":   "\033[38;5;245m",
+    "bold":   "\033[1m",
+    "event":  "\033[0m",
+    "header": "\033[1m",
+    "plus":   "\033[1;32m",
+    "minus":  "\033[31m",
+    "tree":   "\033[2m",
+    "group":  "\033[36m",
+    "count":  "\033[1m",
+    "date":   "\033[2m",
+    "link":   "\033[2;36m",
     "warn":   "\033[33m",
 }
 
+## función C - color ANSI por clave
 def C(key: str) -> str:
     return _ANSI.get(key, "")
+### fin de función C
 
 _ANSI_RE = re.compile(r'\033\[[0-9;]*m')
 
+## función strip_ansi - quita códigos ANSI de un string
 @lru_cache(maxsize=1024)
 def strip_ansi(s: str) -> str:
     return _ANSI_RE.sub('', s)
+### fin de función strip_ansi
 
+## función pad_ansi - rellena string con espacios ignorando ANSI
 def pad_ansi(s: str, width: int) -> str:
     return s + " " * max(0, width - len(strip_ansi(s)))
+### fin de función pad_ansi
 
 # ============================================================================
 # CONFIGURACIÓN
@@ -67,6 +78,7 @@ class Config:
     DEFAULT_EDITOR = os.environ.get("MICRO_EDITOR") or os.environ.get("EDITOR", "micro")
     DEFAULT_VERSIONS_PATH = Path.home() / ".config" / "byte" / "versions"
 
+    ## función __init__ - inicializa Config y carga valores
     def __init__(self):
         self.base: Path = self.DEFAULT_BASE
         self.editor: str = self.DEFAULT_EDITOR
@@ -76,15 +88,19 @@ class Config:
         self.columnas_default: bool = False
         self.search_encrypted: bool = False
         self.versions_path: Path = self.DEFAULT_VERSIONS_PATH
-        self.diff_tool: str = "bat"   # auto, delta, bat, diff
+        self.diff_tool: str = "auto"   # auto, delta, bat, diff
         self._load()
+    ### fin de función __init__
 
+    ## función _load_toml_file - carga un archivo TOML a dict
     def _load_toml_file(self, path: Path) -> Dict[str, Any]:
         if not path.is_file() or tomllib is None:
             return {}
         with open(path, "rb") as f:
             return tomllib.load(f)
+    ### fin de función _load_toml_file
 
+    ## función _create_default_config - crea archivo de configuración por defecto
     def _create_default_config(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
@@ -98,7 +114,9 @@ class Config:
             f'diff_tool = "auto"\n',
             encoding="utf-8"
         )
+    ### fin de función _create_default_config
 
+    ## función _load - carga configuración desde disco (sistema o vault)
     def _load(self) -> None:
         system_path = Path.home() / ".config" / "byte" / "byte.toml"
         cfg = self._load_toml_file(system_path)
@@ -134,7 +152,9 @@ class Config:
             self.diff_tool = cfg.get("diff_tool", "auto")
             if self.diff_tool not in ("auto", "delta", "bat", "diff"):
                 self.diff_tool = "auto"
+    ### fin de función _load
 
+    ## función save - guarda configuración en disco
     def save(self, base: Path, editor: str, gpg_key: str, gpg_keys_secondary: List[str],
              columnas: bool, search_encrypted: bool, versions_path: Path, diff_tool: str = "auto") -> None:
         system_path = Path.home() / ".config" / "byte" / "byte.toml"
@@ -161,6 +181,7 @@ class Config:
         self.versions_path = versions_path
         self.diff_tool = diff_tool
         self.used_config_path = target
+    ### fin de función save
 
 # ============================================================================
 # EXTENSIONES DE TEXTO
@@ -178,13 +199,16 @@ EXT_TEXTO = {
 # UTILIDADES GENERALES (síncronas — solo para uso en contexto no-async)
 # ============================================================================
 
+## función es_remoto - detecta si una ruta es remota (ssh)
 def es_remoto(path: str) -> bool:
     if path.startswith('ssh://'):
         return True
     if ':' in path and not path.startswith('/') and not path.startswith('./') and not path.startswith('../'):
         return True
     return False
+### fin de función es_remoto
 
+## función remote_parse - separa user@host y path de una ruta remota
 def remote_parse(remote: str) -> Tuple[str, str]:
     if remote.startswith('ssh://'):
         rest = remote[6:]
@@ -196,7 +220,9 @@ def remote_parse(remote: str) -> Tuple[str, str]:
     if len(parts) != 2:
         raise ValueError(f"Formato remoto inválido: {remote}")
     return parts[0], parts[1]
+### fin de función remote_parse
 
+## función remote_abbrev - abrevia una ruta remota para mostrar
 def remote_abbrev(remote: str) -> str:
     if ':' not in remote:
         return remote
@@ -204,14 +230,18 @@ def remote_abbrev(remote: str) -> str:
     parts = Path(path).parts
     short_path = f"…/{parts[-2]}/{parts[-1]}" if len(parts) >= 2 else path
     return f"{user_host}:{short_path}"
+### fin de función remote_abbrev
 
+## función calcular_md5 - calcula el hash MD5 de un archivo
 def calcular_md5(path: Path) -> str:
     h = hashlib.md5()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(8192), b""):
             h.update(chunk)
     return h.hexdigest()
+### fin de función calcular_md5
 
+## función detectar_tipo_archivo - detecta si un archivo es texto o binario
 def detectar_tipo_archivo(path: Path) -> str:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -219,7 +249,9 @@ def detectar_tipo_archivo(path: Path) -> str:
         return "text"
     except (UnicodeDecodeError, OSError):
         return "binary"
+### fin de función detectar_tipo_archivo
 
+## función _resaltar - resalta la abreviatura dentro de un texto
 def _resaltar(texto: str, abrev: Optional[str], long: int, color_norm: str, color_res: str) -> str:
     if not abrev:
         return color_norm + texto + C("rst")
@@ -228,11 +260,13 @@ def _resaltar(texto: str, abrev: Optional[str], long: int, color_norm: str, colo
         pre, lbl, post = texto[:idx], texto[idx:idx+long], texto[idx+long:]
         return f"{color_norm}{pre}{C('rst')}{color_res}{lbl}{C('rst')}{color_norm}{post}{C('rst')}"
     return f"{color_norm}{texto} {color_res}{abrev}{C('rst')}"
+### fin de función _resaltar
 
 # ============================================================================
 # UTILIDADES ASYNC (SSH, diff, subprocesos)
 # ============================================================================
 
+## función async_run - ejecuta comando async y captura stdout/stderr
 async def async_run(*cmd: str, input_data: Optional[bytes] = None) -> asyncio.subprocess.Process:
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -244,19 +278,25 @@ async def async_run(*cmd: str, input_data: Optional[bytes] = None) -> asyncio.su
     proc._stdout_data = stdout
     proc._stderr_data = stderr
     return proc
+### fin de función async_run
 
+## función remote_exists_async - verifica si un archivo remoto existe
 async def remote_exists_async(remote: str) -> bool:
     user_host, path = remote_parse(remote)
     proc = await async_run("ssh", user_host, "test", "-f", path)
     return proc.returncode == 0
+### fin de función remote_exists_async
 
+## función remote_read_async - lee contenido de un archivo remoto
 async def remote_read_async(remote: str) -> bytes:
     user_host, path = remote_parse(remote)
     proc = await async_run("ssh", user_host, "cat", path)
     if proc.returncode != 0:
         raise RuntimeError(f"Error leyendo {remote}: {proc._stderr_data.decode()}")
     return proc._stdout_data
+### fin de función remote_read_async
 
+## función remote_write_async - escribe contenido en un archivo remoto
 async def remote_write_async(remote: str, data: bytes) -> None:
     user_host, path = remote_parse(remote)
     proc = await asyncio.create_subprocess_exec(
@@ -268,21 +308,17 @@ async def remote_write_async(remote: str, data: bytes) -> None:
     _, stderr = await proc.communicate(input=data)
     if proc.returncode != 0:
         raise RuntimeError(f"Error escribiendo en {remote}: {stderr.decode()}")
+### fin de función remote_write_async
 
-async def remote_check_async(remote: str, timeout: float = 15.0) -> Optional[Tuple[float, bytes]]:
+## función remote_check_async - consulta mtime y contenido remoto en una sola conexión SSH
+async def remote_check_async(remote: str) -> Optional[Tuple[float, bytes]]:
     """Una sola conexión SSH: devuelve (mtime, contenido) o None si no existe."""
     user_host, path = remote_parse(remote)
     remote_cmd = (
         f'f={shlex.quote(path)}; '
         f'if [ -f "$f" ]; then stat -c %Y "$f" && cat "$f"; else exit 2; fi'
     )
-    try:
-        proc = await asyncio.wait_for(
-            async_run("ssh", "-o", "BatchMode=yes", user_host, remote_cmd),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        raise RuntimeError(f"timeout ({timeout}s) conectando a {remote} — revisa el perfil de shell remoto")
+    proc = await async_run("ssh", user_host, remote_cmd)
     if proc.returncode == 2:
         return None
     if proc.returncode != 0:
@@ -298,12 +334,14 @@ async def remote_check_async(remote: str, timeout: float = 15.0) -> Optional[Tup
     except ValueError:
         raise RuntimeError(f"mtime inválido de {remote}: {mtime_str!r}")
     return mtime, contenido
+### fin de función remote_check_async
 
 # ============================================================================
 # REGISTRO
 # ============================================================================
 
 class Registry:
+    ## función __init__ - inicializa Registry y carga datos
     def __init__(self, base: Path):
         self.path = base / ".byte" / "byte.json"
         self.links_path = Path.home() / ".config" / "byte" / "links.json"
@@ -312,7 +350,9 @@ class Registry:
         self._mtime: float = 0.0
         self._mtime_links: float = 0.0
         self._load()
+    ### fin de función __init__
 
+    ## función _load_links - carga links.json desde disco
     def _load_links(self) -> None:
         if not self.links_path.is_file():
             self._links = {}
@@ -328,7 +368,9 @@ class Registry:
             self._mtime_links = mtime_actual
         except Exception:
             self._links = {}
+    ### fin de función _load_links
 
+    ## función _save_links - guarda links.json en disco
     def _save_links(self) -> None:
         if self._links is None:
             return
@@ -336,7 +378,9 @@ class Registry:
         with open(self.links_path, "w", encoding="utf-8") as f:
             json.dump(self._links, f, indent=2, ensure_ascii=False)
         self._mtime_links = self.links_path.stat().st_mtime
+    ### fin de función _save_links
 
+    ## función _load - carga byte.json desde disco
     def _load(self) -> None:
         if not self.path.is_file():
             self._data = {"info": {}, "gpg": {}, "abbr_cache": {}}
@@ -354,17 +398,23 @@ class Registry:
             self._data = {"info": {}, "gpg": {}, "abbr_cache": {}}
         if self._links is None:
             self._load_links()
+    ### fin de función _load
 
+    ## función _save - guarda byte.json en disco
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.path, "w", encoding="utf-8") as f:
             json.dump(self._data, f, indent=2, ensure_ascii=False)
         self._mtime = self.path.stat().st_mtime
+    ### fin de función _save
 
+    ## función _key - genera clave grupo/stem
     def _key(self, grupo: str, stem: str) -> str:
         return f"{grupo}/{stem}"
+    ### fin de función _key
 
     # --- links ---
+    ## función add_origin - añade un origen enlazado a una entrada
     def add_origin(self, grupo: str, stem: str, ruta: str) -> None:
         self._load_links()
         key = self._key(grupo, stem)
@@ -373,7 +423,9 @@ class Registry:
         if ruta not in self._links[key]:
             self._links[key].append(ruta)
             self._save_links()
+    ### fin de función add_origin
 
+    ## función remove_origin - elimina un origen enlazado de una entrada
     def remove_origin(self, grupo: str, stem: str, ruta: str) -> None:
         self._load_links()
         key = self._key(grupo, stem)
@@ -382,16 +434,22 @@ class Registry:
             if not self._links[key]:
                 del self._links[key]
             self._save_links()
+    ### fin de función remove_origin
 
+    ## función remove_all_origins - elimina todos los orígenes de una entrada
     def remove_all_origins(self, grupo: str, stem: str) -> None:
         self._load_links()
         self._links.pop(self._key(grupo, stem), None)
         self._save_links()
+    ### fin de función remove_all_origins
 
+    ## función get_origins - obtiene los orígenes enlazados de una entrada
     def get_origins(self, grupo: str, stem: str) -> List[str]:
         self._load_links()
         return self._links.get(self._key(grupo, stem), [])
+    ### fin de función get_origins
 
+    ## función rename_links - renombra la clave de enlaces al mover/renombrar entrada
     def rename_links(self, g_src: str, s_src: str, g_dst: str, s_dst: str) -> None:
         self._load_links()
         key_src = self._key(g_src, s_src)
@@ -399,20 +457,26 @@ class Registry:
         if key_src in self._links:
             self._links[key_dst] = self._links.pop(key_src)
             self._save_links()
+    ### fin de función rename_links
 
     # --- info ---
+    ## función get_info - obtiene la nota/info de una entrada
     def get_info(self, grupo: str, stem: str) -> Optional[str]:
         self._load()
         entry = self._data["info"].get(self._key(grupo, stem))
         return entry.get("info") if isinstance(entry, dict) else None
+    ### fin de función get_info
 
+    ## función get_type - obtiene el tipo (text/binary) de una entrada
     def get_type(self, grupo: str, stem: str) -> str:
         self._load()
         entry = self._data["info"].get(self._key(grupo, stem))
         if isinstance(entry, dict) and "type" in entry:
             return entry["type"]
         return "text"
+    ### fin de función get_type
 
+    ## función set_info - guarda la nota/info de una entrada
     def set_info(self, grupo: str, stem: str, texto: str) -> None:
         self._load()
         key = self._key(grupo, stem)
@@ -420,7 +484,9 @@ class Registry:
             self._data["info"][key] = {}
         self._data["info"][key]["info"] = texto.strip()
         self._save()
+    ### fin de función set_info
 
+    ## función set_type - guarda el tipo de una entrada
     def set_type(self, grupo: str, stem: str, tipo: str) -> None:
         self._load()
         key = self._key(grupo, stem)
@@ -428,15 +494,21 @@ class Registry:
             self._data["info"][key] = {}
         self._data["info"][key]["type"] = tipo
         self._save()
+    ### fin de función set_type
 
+    ## función has_info - indica si una entrada tiene nota
     def has_info(self, grupo: str, stem: str) -> bool:
         return self.get_info(grupo, stem) is not None
+    ### fin de función has_info
 
+    ## función remove_info - elimina la nota de una entrada
     def remove_info(self, grupo: str, stem: str) -> None:
         self._load()
         self._data["info"].pop(self._key(grupo, stem), None)
         self._save()
+    ### fin de función remove_info
 
+    ## función rename_info - renombra la clave de info al mover/renombrar entrada
     def rename_info(self, g_src: str, s_src: str, g_dst: str, s_dst: str) -> None:
         self._load()
         key_src = self._key(g_src, s_src)
@@ -444,26 +516,36 @@ class Registry:
         if key_src in self._data["info"]:
             self._data["info"][key_dst] = self._data["info"].pop(key_src)
             self._save()
+    ### fin de función rename_info
 
     # --- gpg ---
+    ## función mark_gpg - marca una entrada como cifrada con una clave GPG
     def mark_gpg(self, grupo: str, stem: str, key_id: str) -> None:
         self._load()
         self._data["gpg"][self._key(grupo, stem)] = key_id
         self._save()
+    ### fin de función mark_gpg
 
+    ## función unmark_gpg - desmarca el cifrado GPG de una entrada
     def unmark_gpg(self, grupo: str, stem: str) -> None:
         self._load()
         self._data["gpg"].pop(self._key(grupo, stem), None)
         self._save()
+    ### fin de función unmark_gpg
 
+    ## función is_protected - indica si una entrada está cifrada
     def is_protected(self, grupo: str, stem: str) -> bool:
         self._load()
         return self._key(grupo, stem) in self._data["gpg"]
+    ### fin de función is_protected
 
+    ## función key_id - obtiene el id de clave GPG de una entrada
     def key_id(self, grupo: str, stem: str) -> Optional[str]:
         self._load()
         return self._data["gpg"].get(self._key(grupo, stem))
+    ### fin de función key_id
 
+    ## función rename_gpg - renombra la clave gpg al mover/renombrar entrada
     def rename_gpg(self, g_src: str, s_src: str, g_dst: str, s_dst: str) -> None:
         self._load()
         key_src = self._key(g_src, s_src)
@@ -471,33 +553,43 @@ class Registry:
         if key_src in self._data["gpg"]:
             self._data["gpg"][key_dst] = self._data["gpg"].pop(key_src)
             self._save()
+    ### fin de función rename_gpg
 
     # --- abbr_cache ---
+    ## función get_abbr_cache - obtiene la caché de abreviaturas guardada
     def get_abbr_cache(self) -> Dict:
         return self._data.get("abbr_cache", {})
+    ### fin de función get_abbr_cache
 
+    ## función set_abbr_cache - guarda la caché de abreviaturas
     def set_abbr_cache(self, abbr_cache: Dict) -> None:
         self._data["abbr_cache"] = abbr_cache
         self._save()
+    ### fin de función set_abbr_cache
 
 # ============================================================================
 # ALMACENAMIENTO
 # ============================================================================
 
 class ByteStorage:
+    ## función __init__ - inicializa ByteStorage
     def __init__(self, base: Path, config: Config):
         self.base = base
         self.byte_dir = base / ".byte"
         self.registry = Registry(base)
         self.versions_path = config.versions_path
         self._dir_cache: Dict[str, Tuple[float, List[Path]]] = {}
+    ### fin de función __init__
 
+    ## función asegurar_base - crea directorios base si no existen
     def asegurar_base(self) -> None:
         self.base.mkdir(parents=True, exist_ok=True)
         self.byte_dir.mkdir(parents=True, exist_ok=True)
         (Path.home() / ".config" / "byte").mkdir(parents=True, exist_ok=True)
         self.versions_path.mkdir(parents=True, exist_ok=True)
+    ### fin de función asegurar_base
 
+    ## función _listar_grupo - lista archivos de un grupo (con caché por mtime)
     def _listar_grupo(self, grupo: str) -> List[Path]:
         gp = self.base / grupo
         if not gp.is_dir():
@@ -511,22 +603,32 @@ class ByteStorage:
                 sorted(f for f in gp.iterdir() if not f.name.startswith(".") and f.is_file())
             )
         return self._dir_cache[grupo][1]
+    ### fin de función _listar_grupo
 
+    ## función _invalidar_cache_grupo - invalida la caché de listado de un grupo
     def _invalidar_cache_grupo(self, grupo: str) -> None:
         self._dir_cache.pop(grupo, None)
+    ### fin de función _invalidar_cache_grupo
 
+    ## función normalize - normaliza texto (minúsculas, sin acentos)
     def normalize(self, txt: str) -> str:
         txt = txt.lower()
         return "".join(c for c in unicodedata.normalize("NFKD", txt) if unicodedata.category(c) != "Mn")
+    ### fin de función normalize
 
+    ## función titulo - capitaliza el título de un grupo/entrada
     def titulo(self, txt: str) -> str:
         return txt.strip().capitalize()
+    ### fin de función titulo
 
+    ## función get_grupos - lista los grupos existentes
     def get_grupos(self) -> List[str]:
         if not self.base.is_dir():
             return []
         return sorted(d.name for d in self.base.iterdir() if d.is_dir() and not d.name.startswith("."))
+    ### fin de función get_grupos
 
+    ## función get_entradas - lista los stems de entradas de un grupo (sin duplicados)
     def get_entradas(self, grupo: str) -> List[str]:
         stems = []
         for f in self._listar_grupo(grupo):
@@ -541,7 +643,9 @@ class ByteStorage:
                 seen.add(norm)
                 unicos.append(s)
         return unicos
+    ### fin de función get_entradas
 
+    ## función get_entrada_path - busca la ruta de archivo de una entrada
     def get_entrada_path(self, grupo: str, stem: str) -> Optional[Path]:
         for f in self._listar_grupo(grupo):
             ext = f.suffix.lower()
@@ -551,13 +655,19 @@ class ByteStorage:
             elif f.stem == stem:
                 return f
         return None
+    ### fin de función get_entrada_path
 
+    ## función grupo_path - ruta de directorio de un grupo
     def grupo_path(self, grupo: str) -> Path:
         return self.base / self.titulo(grupo)
+    ### fin de función grupo_path
 
+    ## función entrada_path - ruta de archivo de una entrada
     def entrada_path(self, grupo: str, stem: str, ext: str = ".md") -> Path:
         return self.base / self.titulo(grupo) / f"{stem}{ext}"
+    ### fin de función entrada_path
 
+    ## función trash - mueve un archivo/directorio al trash
     def trash(self, path: Path) -> None:
         if not path.exists():
             return
@@ -565,18 +675,24 @@ class ByteStorage:
         trash_dir.mkdir(exist_ok=True)
         dest = trash_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{path.name}"
         shutil.move(path, dest)
+    ### fin de función trash
 
+    ## función mtime - obtiene el mtime de un archivo como datetime
     def mtime(self, path: Optional[Path]) -> Optional[datetime]:
         if not path or not path.is_file():
             return None
         return datetime.fromtimestamp(path.stat().st_mtime)
+    ### fin de función mtime
 
+    ## función limpiar_vacios - elimina directorios de grupo vacíos
     def limpiar_vacios(self) -> None:
         for g in self.get_grupos():
             gp = self.grupo_path(g)
             if gp.is_dir() and not any(f for f in gp.iterdir() if not f.name.startswith(".")):
                 gp.rmdir()
+    ### fin de función limpiar_vacios
 
+    ## función leer_entrada - lee el contenido de una entrada (descifra si aplica)
     def leer_entrada(self, grupo: str, stem: str) -> Optional[bytes]:
         path = self.get_entrada_path(grupo, stem)
         if not path or not path.is_file():
@@ -590,7 +706,9 @@ class ByteStorage:
             except RuntimeError:
                 return None
         return path.read_bytes()
+    ### fin de función leer_entrada
 
+    ## función escribir_entrada - escribe contenido en una entrada (cifra si aplica)
     def escribir_entrada(self, grupo: str, stem: str, contenido: bytes,
                          key_id: Optional[str] = None, cifrar: bool = True) -> None:
         ev_path = self.get_entrada_path(grupo, stem)
@@ -617,7 +735,9 @@ class ByteStorage:
         finally:
             tmp_path.unlink()
         self._invalidar_cache_grupo(grupo)
+    ### fin de función escribir_entrada
 
+    ## función _gpg_encrypt - cifra un archivo con GPG
     def _gpg_encrypt(self, plain_path: Path, key_id: str, output_path: Path) -> None:
         keys = [k.strip() for k in key_id.split(",") if k.strip()] if "," in key_id else [key_id]
         out = output_path if output_path.suffix == ".gpg" else Path(str(output_path) + ".gpg")
@@ -630,7 +750,9 @@ class ByteStorage:
             raise RuntimeError(res.stderr.decode())
         if out != output_path:
             out.rename(output_path)
+    ### fin de función _gpg_encrypt
 
+    ## función _gpg_decrypt_to_tmp - descifra un archivo GPG a uno temporal
     def _gpg_decrypt_to_tmp(self, path: Path) -> Path:
         inner_ext = Path(path.stem).suffix or ".bin"
         tmp = tempfile.NamedTemporaryFile(suffix=inner_ext, delete=False)
@@ -644,8 +766,10 @@ class ByteStorage:
             tmp_path.unlink()
             raise RuntimeError(res.stderr.decode())
         return tmp_path
+    ### fin de función _gpg_decrypt_to_tmp
 
     # --- versionado ---
+    ## función guardar_version - guarda una versión histórica de una entrada
     def guardar_version(self, grupo: str, stem: str) -> Optional[Path]:
         ev_path = self.get_entrada_path(grupo, stem)
         if not ev_path or not ev_path.is_file():
@@ -656,7 +780,9 @@ class ByteStorage:
         version_path = version_dir / f"{timestamp}{ev_path.suffix}"
         shutil.copy2(ev_path, version_path)
         return version_path
+    ### fin de función guardar_version
 
+    ## función listar_versiones - lista las versiones guardadas de una entrada
     def listar_versiones(self, grupo: str, stem: str) -> List[Path]:
         version_dir = self.versions_path / grupo / stem
         if not version_dir.is_dir():
@@ -665,7 +791,9 @@ class ByteStorage:
         files = [f for f in version_dir.iterdir() if f.is_file() and pattern.match(f.name)]
         files.sort(key=lambda p: p.name, reverse=True)
         return files
+    ### fin de función listar_versiones
 
+    ## función restaurar_version - restaura una versión histórica de una entrada
     def restaurar_version(self, grupo: str, stem: str, version_path: Path) -> bool:
         if not version_path.is_file():
             return False
@@ -676,19 +804,23 @@ class ByteStorage:
         key_id = self.registry.key_id(grupo, stem) if self.registry.is_protected(grupo, stem) else None
         self.escribir_entrada(grupo, stem, contenido, key_id=key_id, cifrar=bool(key_id))
         return True
+    ### fin de función restaurar_version
 
 # ============================================================================
 # INTERFAZ
 # ============================================================================
 
 class ByteInterface:
+    ## función __init__ - inicializa ByteInterface
     def __init__(self, storage: ByteStorage, columnas_default: bool = False):
         self.storage = storage
         self.registry = storage.registry
         self.columnas_default = columnas_default
         # caché persistente de abreviaturas: {grupo: {"mtime": float, "abbr": dict}}
         self._persistent_cache: Dict = self.registry.get_abbr_cache()
+    ### fin de función __init__
 
+    ## función _get_abreviaturas - obtiene abreviaturas de un grupo (con caché persistente)
     def _get_abreviaturas(self, grupo: str, long: int = 2) -> Dict[str, str]:
         # Para long != 2 se calcula directamente sin persistir
         if long != 2:
@@ -705,7 +837,9 @@ class ByteInterface:
             self._persistent_cache[grupo] = {"mtime": gp.stat().st_mtime, "abbr": abbr}
             self.registry.set_abbr_cache(self._persistent_cache)
         return abbr
+    ### fin de función _get_abreviaturas
 
+    ## función update_all_abbreviations - recalcula y guarda abreviaturas de todos los grupos
     def update_all_abbreviations(self) -> None:
         self._persistent_cache = {}
         for grupo in self.storage.get_grupos():
@@ -715,21 +849,27 @@ class ByteInterface:
             if gp.is_dir():
                 self._persistent_cache[grupo] = {"mtime": gp.stat().st_mtime, "abbr": abbr}
         self.registry.set_abbr_cache(self._persistent_cache)
+    ### fin de función update_all_abbreviations
 
+    ## función invalidar_cache_abreviaturas - invalida la caché de abreviaturas (uno o todos los grupos)
     def invalidar_cache_abreviaturas(self, grupo: Optional[str] = None) -> None:
         if grupo is None:
             self._persistent_cache.clear()
         else:
             self._persistent_cache.pop(grupo, None)
         self.registry.set_abbr_cache(self._persistent_cache)
+    ### fin de función invalidar_cache_abreviaturas
 
+    ## función leer - lee una línea de input del usuario
     def leer(self, prompt: str) -> str:
         try:
             return input(prompt).strip()
         except (KeyboardInterrupt, EOFError):
             print(f"\n  {C('tree')}(Interrumpido){C('rst')}")
             sys.exit(0)
+    ### fin de función leer
 
+    ## función calc_abreviaturas - calcula abreviaturas únicas para una lista de nombres
     def calc_abreviaturas(self, lista: List[str], long: int) -> Dict[str, str]:
         max_long = max(long, 5)
         resultado: Dict[str, str] = {}
@@ -747,7 +887,9 @@ class ByteInterface:
                     break
             resultado[item] = encontrado or item[:max_long]
         return {item: resultado[item] for item in lista}
+    ### fin de función calc_abreviaturas
 
+    ## función render_ruta - renderiza la ruta Grupo/entrada con colores y abreviaturas
     def render_ruta(self, grupo: str, stem: str) -> str:
         g_abbr = self.calc_abreviaturas(self.storage.get_grupos(), 3)
         g_render = _resaltar(grupo, g_abbr.get(grupo), 3, C("group"), C("bold"))
@@ -757,14 +899,18 @@ class ByteInterface:
         e_abbr = self._get_abreviaturas(grupo)
         e_render = _resaltar(stem, e_abbr.get(stem), 2, C("event"), C("bold"))
         return f"{g_render}{C('tree')}/{C('rst')}{e_render}"
+    ### fin de función render_ruta
 
+    ## función _fmt_origin - formatea un origen para mostrar (abreviado)
     def _fmt_origin(self, path_str: str) -> str:
         if es_remoto(path_str):
             return remote_abbrev(path_str)
         p = Path(path_str)
         parts = p.parts
         return f"…/{parts[-2]}/{parts[-1]}" if len(parts) >= 2 else path_str
+    ### fin de función _fmt_origin
 
+    ## función _get_badges_compactos - genera badges compactos de estado de una entrada
     def _get_badges_compactos(self, grupo: str, stem: str) -> str:
         r = self.storage.registry
         b1 = f"{C('warn')}g{C('rst')}" if r.is_protected(grupo, stem) else " "
@@ -782,7 +928,9 @@ class ByteInterface:
             b3 = " "
         b4 = f"{C('date')}b{C('rst')}" if (not r.is_protected(grupo, stem) and r.get_type(grupo, stem) == "binary") else " "
         return b1 + b2 + b3 + b4
+    ### fin de función _get_badges_compactos
 
+    ## función _render_entrada_linea - renderiza la línea de una entrada (compacta o completa)
     def _render_entrada_linea(self, grupo: str, stem: str, ev_path: Optional[Path],
                               e_abbr: Dict[str, str], compact: bool = False) -> str:
         event_render = _resaltar(stem, e_abbr.get(stem), 2, C("event"), C("bold"))
@@ -819,7 +967,9 @@ class ByteInterface:
                         parts.append(f"{C('date')}c → {origen_fmt}{C('rst')}")
             origins_str = f" {C('date')}·{C('rst')} " + f"{C('date')}, {C('rst')}".join(parts)
         return f"{display_name}{badges}{origins_str}"
+    ### fin de función _render_entrada_linea
 
+    ## función print_arbol_columnas - imprime el árbol de grupos/entradas en columnas
     def print_arbol_columnas(self, show_dates: bool = False) -> None:
         grupos = self.storage.get_grupos()
         if not grupos:
@@ -828,6 +978,7 @@ class ByteInterface:
         term_width = shutil.get_terminal_size().columns
         g_abbr_tmp = self.calc_abreviaturas(grupos, 3)
 
+        ## función ancho_grupo - calcula el ancho máximo de un grupo en columnas
         def ancho_grupo(grupo: str, evs: List[str]) -> int:
             e_abbr = self._get_abreviaturas(grupo)
             header = f"{_resaltar(grupo, g_abbr_tmp.get(grupo), 3, C('group'), C('bold'))} {C('date')}({len(evs)}){C('rst')}"
@@ -837,6 +988,7 @@ class ByteInterface:
                 linea = self._render_entrada_linea(grupo, stem, ev_path, e_abbr, compact=True)
                 max_ancho = max(max_ancho, len(strip_ansi(linea)))
             return max_ancho
+        ### fin de función ancho_grupo
 
         grupos_data = [(g, self.storage.get_entradas(g)) for g in grupos]
         anchos = [ancho_grupo(g, evs) + 2 for g, evs in grupos_data]
@@ -864,9 +1016,11 @@ class ByteInterface:
                 for col, ancho in zip(columnas, fila_anchos):
                     celda = col[fi] if fi < len(col) else ""
                     partes.append(pad_ansi(celda, ancho - 2))
+    ### fin de función ancho_grupo
                 print(sep.join(partes).rstrip())
             print()
 
+    ## función print_arbol - imprime el árbol de grupos/entradas
     def print_arbol(self, grupos_filter: Optional[List[str]] = None,
                     show_dates: bool = False, column_mode: bool = False) -> None:
         if column_mode:
@@ -897,7 +1051,9 @@ class ByteInterface:
                         line += f"  {d}{mt.strftime('%Y-%m-%d %H:%M')}{r}"
                 print(f"  {line}")
         print()
+    ### fin de función print_arbol
 
+    ## función pedir_grupo - solicita al usuario un grupo (con autocompletado)
     def pedir_grupo(self, label: str = "Grupo", mostrar_arbol: bool = True) -> str:
         if mostrar_arbol:
             self.print_arbol(column_mode=self.columnas_default)
@@ -917,7 +1073,9 @@ class ByteInterface:
                 if self.storage.normalize(g) == res_norm:
                     return g
             return self.storage.titulo(res)
+    ### fin de función pedir_grupo
 
+    ## función pedir_entrada - solicita al usuario una entrada (con autocompletado)
     def pedir_entrada(self, grupo: str, label: str = "Entrada") -> str:
         evs = self.storage.get_entradas(grupo)
         if evs:
@@ -942,18 +1100,22 @@ class ByteInterface:
                 if self.storage.normalize(e) == res_norm:
                     return e
             return res
+    ### fin de función pedir_entrada
 
 # ============================================================================
 # APLICACIÓN
 # ============================================================================
 
 class ByteApp:
+    ## función __init__ - inicializa ByteApp
     def __init__(self, config: Config):
         self.config = config
         self.storage = ByteStorage(config.base, config)
         self.ui = ByteInterface(self.storage, config.columnas_default)
+    ### fin de función __init__
 
     # --- resolución de argumentos ---
+    ## función find_grupo - busca un grupo por nombre o abreviatura
     def find_grupo(self, token: str) -> Optional[str]:
         grupos = self.storage.get_grupos()
         if token in grupos:
@@ -967,7 +1129,9 @@ class ByteApp:
             if self.storage.normalize(g) == token_norm:
                 return g
         return None
+    ### fin de función find_grupo
 
+    ## función parse_arg - parsea un argumento tipo Grupo/entrada
     def parse_arg(self, arg: str) -> Tuple[Optional[str], Optional[str]]:
         if not arg:
             return None, None
@@ -990,7 +1154,9 @@ class ByteApp:
         if m:
             return self.find_grupo(m.group(1)) or self.storage.titulo(m.group(1)), None
         return None, arg
+    ### fin de función parse_arg
 
+    ## función resolver_arg - resuelve un argumento a (grupo, stem)
     def resolver_arg(self, arg: str) -> Tuple[Optional[str], Optional[str]]:
         g, e = self.parse_arg(arg)
         if g and e:
@@ -1014,7 +1180,9 @@ class ByteApp:
         if grupo:
             return grupo, None
         return None, token
+    ### fin de función resolver_arg
 
+    ## función _validar_stem - valida que un stem sea válido (largo, no reservado)
     def _validar_stem(self, stem: str) -> bool:
         if len(stem) < 4:
             print(f"{C('warn')}El nombre debe tener al menos 4 caracteres.{C('rst')}")
@@ -1024,14 +1192,18 @@ class ByteApp:
             print(f"{C('warn')}'{stem}' es un alias de comando reservado.{C('rst')}")
             return False
         return True
+    ### fin de función _validar_stem
 
+    ## función _fmt_version_fecha - formatea la fecha de una versión
     def _fmt_version_fecha(self, vpath: Path) -> str:
         try:
             return datetime.strptime(vpath.stem, "%Y%m%d_%H%M%S").strftime("%Y-%m-%d %H:%M:%S")
         except ValueError:
             return vpath.stem
+    ### fin de función _fmt_version_fecha
 
     # --- Métodos de diff ---
+    ## función _diff_tool_async - detecta la herramienta de diff disponible
     async def _diff_tool_async(self) -> Optional[str]:
         if self.config.diff_tool != "auto":
             if shutil.which(self.config.diff_tool):
@@ -1040,7 +1212,9 @@ class ByteApp:
             if shutil.which(tool):
                 return tool
         return None
+    ### fin de función _diff_tool_async
 
+    ## función mostrar_diff_async - muestra el diff entre dos archivos locales
     async def mostrar_diff_async(self, a: Path, b: Path) -> None:
         proc = await async_run("diff", "-u", str(a), str(b))
         if not proc._stdout_data.strip():
@@ -1066,7 +1240,9 @@ class ByteApp:
             tmp.unlink()
         else:
             print(diff_text.decode(errors="replace"), end="")
+    ### fin de función mostrar_diff_async
 
+    ## función mostrar_diff_remoto_async - muestra el diff entre un archivo local y contenido remoto
     async def mostrar_diff_remoto_async(self, local: Path, contenido_remoto: bytes) -> None:
         with tempfile.NamedTemporaryFile(mode='wb', suffix='.tmp', delete=False) as tf:
             tf.write(contenido_remoto)
@@ -1075,8 +1251,10 @@ class ByteApp:
             await self.mostrar_diff_async(local, tmp)
         finally:
             tmp.unlink()
+    ### fin de función mostrar_diff_remoto_async
 
     # --- comandos ---
+    ## función cmd_open - abre, crea o añade texto a una entrada
     def cmd_open(self, args: List[str]) -> None:
         if not sys.stdout.isatty() and len(args) == 1:
             grupo, stem = self.resolver_arg(args[0])
@@ -1236,7 +1414,9 @@ class ByteApp:
             print(f"{accion} {ruta_fmt}{C('rst')}")
             if es_nuevo:
                 self.storage.registry.set_type(grupo, stem, "text")
+    ### fin de función cmd_open
 
+    ## función cmd_link - enlaza un archivo externo a una entrada (expande rutas a absolutas)
     async def cmd_link(self, args: List[str]) -> None:
         if not args:
             archivo = self.ui.leer("Archivo a enlazar: ")
@@ -1439,7 +1619,9 @@ class ByteApp:
             return
 
         print(f"{C('minus')}  Ni el externo ni la entrada existen.{C('rst')}")
+    ### fin de función cmd_link
 
+    ## función cmd_unlink - desenlaza el origen de una entrada
     def cmd_unlink(self, args: List[str]) -> None:
         if not args:
             enlazados = [
@@ -1498,7 +1680,9 @@ class ByteApp:
                         print(f"{C('minus')}  {self.ui.render_ruta(grupo, stem)}  {C('date')}desenlazado{C('rst')}")
                 else:
                     print("  Número inválido.")
+    ### fin de función cmd_unlink
 
+    ## función cmd_del - envía una entrada o grupo al trash
     def cmd_del(self, args: List[str]) -> None:
         entrada = args[0] if args else self.ui.leer("Borrar Grupo/ o entrada: ")
         if not entrada:
@@ -1566,7 +1750,9 @@ class ByteApp:
 
         elif op == 'v':
             self._borrar_version_interactivo(grupo, stem, versiones)
+    ### fin de función cmd_del
 
+    ## función _borrar_version_interactivo - borra una versión de forma interactiva
     def _borrar_version_interactivo(self, grupo: str, stem: str, versiones: List[Path]) -> None:
         if len(versiones) == 1:
             vpath = versiones[0]
@@ -1597,7 +1783,9 @@ class ByteApp:
                     print(f"{C('date')}Cancelado.{C('rst')}")
             else:
                 print(f"{C('warn')}Índice inválido.{C('rst')}")
+    ### fin de función _borrar_version_interactivo
 
+    ## función _unlink_version - elimina un archivo de versión y limpia directorios vacíos
     def _unlink_version(self, vpath: Path) -> None:
         vpath.unlink()
         parent = vpath.parent
@@ -1606,7 +1794,9 @@ class ByteApp:
             gp = parent.parent
             if gp.is_dir() and not any(gp.iterdir()):
                 gp.rmdir()
+    ### fin de función _unlink_version
 
+    ## función _renombrar - renombra una entrada dentro del mismo grupo
     def _renombrar(self, grupo: str, origen: str, destino: str) -> None:
         if not self._validar_stem(destino):
             return
@@ -1628,7 +1818,9 @@ class ByteApp:
         self.storage._invalidar_cache_grupo(grupo)
         self.ui.invalidar_cache_abreviaturas(grupo)
         print(f"{C('plus')}✓ Renombrado: {grupo}/{origen} → {grupo}/{destino}{C('rst')}")
+    ### fin de función _renombrar
 
+    ## función _mover - mueve una entrada a otro grupo
     def _mover(self, g_src: str, e_src: str, g_dest: str, e_dest: str) -> None:
         if not self._validar_stem(e_dest):
             return
@@ -1660,7 +1852,9 @@ class ByteApp:
             self.ui.invalidar_cache_abreviaturas(g)
         self.storage.limpiar_vacios()
         print(f"{C('plus')}✓ Movido: {self.ui.render_ruta(g_src, e_src)} ➔ {self.ui.render_ruta(g_dest, e_dest)}{C('rst')}")
+    ### fin de función _mover
 
+    ## función _fusionar - fusiona dos entradas en una
     def _fusionar(self, g_dest: str, e_dest: str, g_src: str, e_src: str) -> None:
         if g_src == g_dest and e_src == e_dest:
             print(f"{C('warn')}No se puede fusionar consigo mismo.{C('rst')}")
@@ -1695,7 +1889,9 @@ class ByteApp:
             self.ui.invalidar_cache_abreviaturas(g)
         self.storage.limpiar_vacios()
         print(f"{C('plus')}✓ Fusionado: {self.ui.render_ruta(g_src, e_src)} ➔ {self.ui.render_ruta(g_dest, e_dest)}{C('rst')}")
+    ### fin de función _fusionar
 
+    ## función cmd_mv - mueve o fusiona entradas (interactivo o por argumentos)
     def cmd_mv(self, args: List[str]) -> None:
         if not args:
             self.ui.print_arbol(column_mode=self.ui.columnas_default)
@@ -1752,7 +1948,9 @@ class ByteApp:
             self._fusionar(g_origen, e_dest, g_origen, e_origen)
         else:
             self._mover(g_origen, e_origen, g_origen, e_dest)
+    ### fin de función cmd_mv
 
+    ## función _clave_existe - verifica si una clave GPG existe en el llavero
     def _clave_existe(self, clave: str) -> bool:
         try:
             result = subprocess.run(
@@ -1762,7 +1960,9 @@ class ByteApp:
             return result.returncode == 0 and ("pub" in result.stdout or "uid" in result.stdout)
         except Exception:
             return False
+    ### fin de función _clave_existe
 
+    ## función cmd_gpg - cifra una entrada con GPG o añade destinatarios
     def cmd_gpg(self, args: List[str]) -> None:
         if not shutil.which("gpg"):
             print("gpg no disponible.")
@@ -1880,7 +2080,9 @@ class ByteApp:
         ev_path.unlink()
         self.storage.registry.mark_gpg(grupo, stem, key_id_str)
         print(f"{C('plus')}~ {ruta_fmt}{r}  {w}g{r} {w}{self.config.gpg_key}{r}")
+    ### fin de función cmd_gpg
 
+    ## función cmd_nogpg - descifra una entrada protegida con GPG
     def cmd_nogpg(self, args: List[str]) -> None:
         if not shutil.which("gpg"):
             print("gpg no disponible.")
@@ -1922,7 +2124,9 @@ class ByteApp:
         self.storage._invalidar_cache_grupo(grupo)
         self.ui.invalidar_cache_abreviaturas(grupo)
         print(f"{C('plus')}~ {self.ui.render_ruta(grupo, stem)}{C('rst')} (descifrado)")
+    ### fin de función cmd_nogpg
 
+    ## función cmd_check - verifica configuración y sincronización de enlaces
     async def cmd_check(self, args: List[str]) -> None:
         """Muestra configuración y verifica sincronización de enlaces."""
         c, d, r, w = C("header"), C("date"), C("rst"), C("warn")
@@ -1974,6 +2178,7 @@ class ByteApp:
             return
 
         # Verificar todos los enlaces en paralelo
+        ## función verificar - verifica si una entrada está sincronizada con su origen
         async def verificar(g: str, stem: str, ev_path: Path, src_str: str):
             if not es_remoto(src_str):
                 src = Path(src_str)
@@ -1986,8 +2191,10 @@ class ByteApp:
                         return g, stem, ev_path, src_str, None, None, "gpg_error"
                     diff = contenido_ev != src.read_bytes()
                 else:
+                    ## función archivos_iguales - compara si dos archivos locales son iguales
                     def archivos_iguales(a: Path, b: Path) -> bool:
                         return a.stat().st_size == b.stat().st_size and calcular_md5(a) == calcular_md5(b)
+                    ### fin de función archivos_iguales
                     diff = not archivos_iguales(ev_path, src)
                 return g, stem, ev_path, src_str, diff, None, None
             else:
@@ -2005,6 +2212,7 @@ class ByteApp:
                         return g, stem, ev_path, src_str, None, None, "gpg_error"
                     diff = contenido_ev != contenido_remoto
                 else:
+        ### fin de función archivos_iguales
                     diff = ev_path.read_bytes() != contenido_remoto
                 return g, stem, ev_path, src_str, diff, (mtime_remoto, contenido_remoto), None
 
@@ -2100,11 +2308,13 @@ class ByteApp:
                 else:
                     print(f"{d}  Omitido{r}")
                     break
+    ### fin de función archivos_iguales
 
         print(f"{d}Revisión completada.{r}")
         self.ui.update_all_abbreviations()
         print(f"{d}Caché de abreviaturas actualizada.{r}")
 
+    ## función cmd_info - muestra o guarda la nota de una entrada/grupo
     def cmd_info(self, args: List[str]) -> None:
         if not args:
             encontrado = False
@@ -2158,7 +2368,9 @@ class ByteApp:
             versiones = self.storage.listar_versiones(grupo, s)
             ver_str = f" {C('date')}[{len(versiones)}v]{C('rst')}" if versiones else ""
             print(f"  {badges} {ruta_fmt}: {C('date')}{txt}{C('rst')}{ver_str}")
+    ### fin de función cmd_info
 
+    ## función cmd_config - configuración interactiva de byte
     def cmd_config(self, args: List[str]) -> None:
         c, r, d, w = C("bold"), C("rst"), C("date"), C("warn")
         system_path = Path.home() / ".config" / "byte" / "byte.toml"
@@ -2221,7 +2433,9 @@ class ByteApp:
         self.storage = ByteStorage(self.config.base, self.config)
         self.ui = ByteInterface(self.storage, self.config.columnas_default)
         print(f"{C('plus')}✓ Guardado en {disp}{r}")
+    ### fin de función cmd_config
 
+    ## función cmd_version - guarda una versión de una entrada
     def cmd_version(self, args: List[str]) -> None:
         if not args:
             self.ui.print_arbol(column_mode=self.ui.columnas_default)
@@ -2253,7 +2467,9 @@ class ByteApp:
                   f" → {C('date')}{self._fmt_version_fecha(version_path)}{C('rst')}")
         else:
             print(f"{C('warn')}Error al guardar la versión.{C('rst')}")
+    ### fin de función cmd_version
 
+    ## función cmd_restore - restaura una versión anterior de una entrada
     async def cmd_restore(self, args: List[str]) -> None:
         if not args:
             self.ui.print_arbol(column_mode=self.ui.columnas_default)
@@ -2331,7 +2547,9 @@ class ByteApp:
             self.ui.invalidar_cache_abreviaturas(grupo)
         else:
             print(f"{C('warn')}Error al restaurar.{C('rst')}")
+    ### fin de función cmd_restore
 
+    ## función cmd_search - busca un patrón de texto en las entradas
     def cmd_search(self, args: List[str]) -> None:
         if not args:
             print(f"{C('warn')}Uso: byte s <patrón> [grupo/]{C('rst')}")
@@ -2402,7 +2620,9 @@ class ByteApp:
 
         if not found:
             print(f"{C('date')}No se encontraron coincidencias para '{pattern}'.{C('rst')}")
+    ### fin de función cmd_search
 
+    ## función mostrar_ayuda - muestra la ayuda de comandos
     def mostrar_ayuda(self) -> None:
         h, t, d, r, w = C("header"), C("tree"), C("date"), C("rst"), C("warn")
         print(f"{h}BYTE — Notas en Markdown y archivos binarios{r}\n")
@@ -2432,11 +2652,13 @@ class ByteApp:
         print()
         print(f"  {h}Indicadores{r}")
         print(f"  {w}g{r} gpg  {d}b{r} binario  {w}i{r} info  {d}c →{r} copia  {d}r →{r} remoto  {d}x{r} enlace roto")
+    ### fin de función mostrar_ayuda
 
 # ============================================================================
 # MAIN
 # ============================================================================
 
+## función async_main - punto de entrada async: parsea argumentos y despacha comandos
 async def async_main() -> None:
     config = Config()
     app = ByteApp(config)
@@ -2488,10 +2710,13 @@ async def async_main() -> None:
         sync_cmds[cmd_clean](rest)
     else:
         app.cmd_open([cmd] + rest)
+### fin de función async_main
 
 
+## función main - punto de entrada del programa
 def main() -> None:
     asyncio.run(async_main())
+### fin de función main
 
 
 if __name__ == "__main__":
