@@ -839,7 +839,7 @@ class ByteInterface:
                 print(f"{indent}  {l}")
             return
         print(f"{indent}{titulo_izq.ljust(ancho_izq)}{sep}{titulo_der}")
-        print(f"{indent}{'─' * ancho_izq}{sep}{'─' * ancho_der}")
+        print(f"{indent}{'-' * ancho_izq}{sep}{'-' * ancho_der}")
         max_filas = max(len(lineas_izq), len(lineas_der))
         for i in range(max_filas):
             li = lineas_izq[i] if i < len(lineas_izq) else ""
