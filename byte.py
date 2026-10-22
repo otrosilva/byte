@@ -2,10 +2,37 @@
 # -*- coding: utf-8 -*-
 """
 byte.py — gestor de notas Markdown y archivos binarios (Linux/macOS)
-v1.0 (con listado de enlaces y filtros)
+v1.2 (con colores y abreviaturas en negrita)
+
+Cambios respecto a v1.1:
+  - Conflictos (link y check): se usa «Vault» y «Externo» en lugar de
+    «entrada» y «origen». Teclas: [v] vault→externo, [e] externo→vault.
+
+Cambios respecto a v1.1 (check):
+  - cmd_check: nueva opción [f]usionar para entradas de texto con conflicto
+    (entrada y origen cambiados de forma distinta): genera marcadores de
+    conflicto tipo git, abre el editor y permite guardar el resultado en
+    la entrada y, opcionalmente, subirlo también al origen.
+
+Cambios respecto a v1.0:
+  - Cache de abreviaturas de GRUPO (antes solo se cacheaban las de entrada),
+    evitando recalcular calc_abreviaturas() en cada render_ruta().
+  - cmd_check ya no re-escanea el directorio por cada entrada (usa
+    get_entrada_paths_map, igual que ya hacía el árbol).
+  - Conexiones SSH con BatchMode=yes para no colgarse esperando un prompt
+    interactivo en hosts sin ControlMaster/timeouts configurados en
+    ~/.ssh/config.
+  - Expansión de '~' en rutas remotas resuelta consultando $HOME real del
+    remoto (remote_home_async) en vez de asumir /home/<user>.
+  - Semáforo en cmd_check para acotar cuántas conexiones remotas se abren
+    en paralelo.
+  - Soporte de Externos cifrados (.gpg/.pgp): se descifran para comparar,
+    mostrar diff y fusionar; destinatarios GPG sincronizados desde el
+    propio archivo .gpg.
 """
 import os
 import sys
+import getpass
 import re
 import json
 import shutil
@@ -17,7 +44,7 @@ import hashlib
 import asyncio
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any, Callable
+from typing import Dict, List, Optional, Set, Tuple, Any, Callable
 from functools import lru_cache
 try:
     import tomllib
@@ -27,7 +54,7 @@ except ImportError:
     except ImportError:
         tomllib = None
 
-__version__ = "1.0"
+__version__ = "1.2"
 # ============================================================================
 # COLORES ANSI
 # ============================================================================
@@ -171,6 +198,16 @@ EXT_TEXTO = {
     ".gitconfig", ".gitignore", ".editorconfig",
 }
 # ============================================================================
+# SSH — opciones comunes
+# ============================================================================
+# BatchMode=yes evita que ssh se quede colgado pidiendo una passphrase o
+# contraseña interactiva si el host no tiene claves/agent configurado, o si
+# no coincide con ningún bloque de ~/.ssh/config con sus propios timeouts
+# (pinito/popeye ya definen ConnectTimeout/ServerAlive* ahí; esto es la red
+# de seguridad para cualquier otro host remoto que reciba byte.py).
+SSH_OPTS: List[str] = ["-o", "BatchMode=yes"]
+
+# ============================================================================
 # UTILIDADES GENERALES
 # ============================================================================
 def es_remoto(path: str) -> bool:
@@ -215,6 +252,22 @@ def detectar_tipo_archivo(path: Path) -> str:
     except (UnicodeDecodeError, OSError):
         return "binary"
 
+def es_texto_bytes(data: bytes) -> bool:
+    """True si el contenido es texto UTF-8 (sin NUL)."""
+    if b"\x00" in data:
+        return False
+    try:
+        data.decode("utf-8")
+        return True
+    except UnicodeDecodeError:
+        return False
+
+def externo_es_cifrado(src_str: str, cabecera: Optional[bytes] = None) -> bool:
+    """El archivo externo es un GPG: por su nombre (.gpg/.pgp) o por su cabecera ASCII."""
+    if src_str.lower().endswith((".gpg", ".pgp")):
+        return True
+    return cabecera is not None and cabecera.lstrip().startswith(b"-----BEGIN PGP MESSAGE-----")
+
 def _resaltar(texto: str, abrev: Optional[str], long: int, color_norm: str, color_res: str) -> str:
     """Resalta la abreviatura en negrita (color_res) y el resto en color_norm."""
     if not abrev:
@@ -228,9 +281,11 @@ def _resaltar(texto: str, abrev: Optional[str], long: int, color_norm: str, colo
 # ============================================================================
 # UTILIDADES ASYNC
 # ============================================================================
-async def async_run(*cmd: str, input_data: Optional[bytes] = None) -> asyncio.subprocess.Process:
+async def async_run(*cmd: str, input_data: Optional[bytes] = None,
+                    env: Optional[Dict[str, str]] = None) -> asyncio.subprocess.Process:
     proc = await asyncio.create_subprocess_exec(
         *cmd,
+        env=env,
         stdin=asyncio.subprocess.PIPE if input_data is not None else asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -242,20 +297,39 @@ async def async_run(*cmd: str, input_data: Optional[bytes] = None) -> asyncio.su
 
 async def remote_exists_async(remote: str) -> bool:
     user_host, path = remote_parse(remote)
-    proc = await async_run("ssh", user_host, "test", "-f", path)
+    proc = await async_run("ssh", *SSH_OPTS, user_host, "test", "-f", path)
     return proc.returncode == 0
 
 async def remote_read_async(remote: str) -> bytes:
     user_host, path = remote_parse(remote)
-    proc = await async_run("ssh", user_host, "cat", path)
+    proc = await async_run("ssh", *SSH_OPTS, user_host, "cat", path)
     if proc.returncode != 0:
         raise RuntimeError(f"Error leyendo {remote}: {proc._stderr_data.decode()}")
     return proc._stdout_data
 
+async def remote_gpg_descifrar_async(remote: str, passphrase: str) -> bytes:
+    """Descifra un .gpg en el propio servidor (donde está su clave) y devuelve el texto.
+    La contraseña viaja por stdin dentro del canal cifrado de ssh, nunca en la
+    línea de comandos."""
+    user_host, path = remote_parse(remote)
+    cmd = ("LC_ALL=C gpg --batch --quiet --pinentry-mode loopback "
+           f"--passphrase-fd 0 -d {shlex.quote(path)}")
+    proc = await asyncio.create_subprocess_exec(
+        "ssh", *SSH_OPTS, user_host, cmd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out, err = await proc.communicate(input=(passphrase + "\n").encode())
+    if proc.returncode != 0:
+        raise RuntimeError(err.decode(errors="replace"))
+    return out
+
 async def remote_write_async(remote: str, data: bytes) -> None:
     user_host, path = remote_parse(remote)
     proc = await asyncio.create_subprocess_exec(
-        "ssh", user_host, f"cat > {shlex.quote(path)}",
+        "ssh", *SSH_OPTS, user_host,
+        f'mkdir -p "$(dirname {shlex.quote(path)})" && cat > {shlex.quote(path)}',
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -273,7 +347,7 @@ async def remote_check_async(remote: str) -> Optional[Tuple[float, bytes]]:
         f'  echo "$mtime" && cat "$f"; '
         f'else exit 2; fi'
     )
-    proc = await async_run("ssh", user_host, remote_cmd)
+    proc = await async_run("ssh", *SSH_OPTS, user_host, remote_cmd)
     if proc.returncode == 2:
         return None
     if proc.returncode != 0:
@@ -289,6 +363,19 @@ async def remote_check_async(remote: str) -> Optional[Tuple[float, bytes]]:
     except ValueError:
         raise RuntimeError(f"mtime inválido de {remote}: {mtime_str!r}")
     return mtime, contenido
+
+async def remote_home_async(user_host: str) -> str:
+    """Resuelve el $HOME real del remoto en vez de asumir /home/<user>
+    (falla en macOS -> /Users/, o en remotos con home no estándar)."""
+    try:
+        proc = await async_run("ssh", *SSH_OPTS, user_host, "sh", "-c", "echo $HOME")
+        home = proc._stdout_data.decode(errors="replace").strip()
+        if proc.returncode == 0 and home:
+            return home
+    except Exception:
+        pass
+    user = user_host.split('@')[0] if '@' in user_host else user_host
+    return '/root' if user == 'root' else f'/home/{user}'
 
 # ============================================================================
 # REGISTRO
@@ -480,6 +567,8 @@ class ByteStorage:
         self.registry = Registry(base)
         self.versions_path = config.versions_path
         self._dir_cache: Dict[str, Tuple[float, List[Path]]] = {}
+        self._gpg_sync_cache: Dict[Path, float] = {}
+        self.ultimo_gpg_error: str = ""
 
     def asegurar_base(self) -> None:
         self.base.mkdir(parents=True, exist_ok=True)
@@ -541,6 +630,18 @@ class ByteStorage:
                 return f
         return None
 
+    def get_entrada_paths_map(self, grupo: str) -> Dict[str, Path]:
+        """Como get_entrada_path pero para todas las entradas del grupo a la vez,
+        evitando un escaneo lineal por cada stem cuando se itera sobre varias
+        entradas del mismo grupo (por ejemplo al dibujar el árbol o en --check)."""
+        mapa: Dict[str, Path] = {}
+        for f in self._listar_grupo(grupo):
+            ext = f.suffix.lower()
+            stem = Path(f.stem).stem if ext == ".gpg" else f.stem
+            if stem not in mapa:
+                mapa[stem] = f
+        return mapa
+
     def grupo_path(self, grupo: str) -> Path:
         return self.base / self.titulo(grupo)
 
@@ -576,7 +677,8 @@ class ByteStorage:
                 contenido = tmp.read_bytes()
                 tmp.unlink()
                 return contenido
-            except RuntimeError:
+            except RuntimeError as e:
+                self.ultimo_gpg_error = str(e)
                 return None
         return path.read_bytes()
 
@@ -585,7 +687,7 @@ class ByteStorage:
         ev_path = self.get_entrada_path(grupo, stem)
         if cifrar:
             if key_id is None:
-                key_id = self.registry.key_id(grupo, stem)
+                key_id = self.key_id_vigente(grupo, stem)
             debe_cifrar = key_id is not None
         else:
             debe_cifrar = False
@@ -617,6 +719,52 @@ class ByteStorage:
         if out != output_path:
             out.rename(output_path)
 
+    @staticmethod
+    def gpg_descifrar_bytes(data: bytes, passphrase: Optional[str] = None) -> bytes:
+        """Descifra contenido GPG (binario o ASCII-armored).
+        Se pasa por un archivo temporal (no por stdin) para que gpg conserve la
+        terminal y pueda pedir la contraseña de la clave con pinentry. Si se da
+        passphrase, se entrega a gpg por stdin (modo loopback), sin pinentry."""
+        with tempfile.NamedTemporaryFile(suffix=".gpg", delete=False) as tf:
+            tf.write(data)
+            ruta = Path(tf.name)
+        try:
+            env = dict(os.environ)
+            if "GPG_TTY" not in env and sys.stdin.isatty():
+                try:
+                    env["GPG_TTY"] = os.ttyname(sys.stdin.fileno())
+                except OSError:
+                    pass
+            env["LC_ALL"] = "C"   # mensajes de gpg en inglés para poder interpretarlos
+            cmd = ["gpg", "--batch", "--quiet"]
+            kw: Dict[str, Any] = {}
+            if passphrase is not None:
+                cmd += ["--pinentry-mode", "loopback", "--passphrase-fd", "0"]
+                kw["input"] = (passphrase + "\n").encode()
+            res = subprocess.run(cmd + ["-d", str(ruta)], capture_output=True, env=env, **kw)
+        finally:
+            ruta.unlink(missing_ok=True)
+        if res.returncode != 0:
+            raise RuntimeError(res.stderr.decode(errors="replace"))
+        return res.stdout
+
+    @staticmethod
+    def gpg_explicar_error(stderr: str) -> str:
+        """Resume en una línea por qué falló gpg al descifrar."""
+        t = stderr.lower()
+        if "no secret key" in t:
+            ids = list(dict.fromkeys(i.upper() for i in re.findall(r"\bid ([0-9a-f]{8,16})", stderr, re.I)))
+            extra = f" (cifrado para las claves: {', '.join(ids)})" if ids else ""
+            return "este equipo no tiene la clave secreta con la que está cifrado" + extra
+        if any(x in t for x in ("pinentry", "inappropriate ioctl", "no tty", "not a tty")):
+            return "gpg no pudo pedir la contraseña de la clave (sin terminal); prueba: export GPG_TTY=$(tty)"
+        if any(x in t for x in ("bad passphrase", "cancelled", "canceled")):
+            return "contraseña de la clave incorrecta o cancelada"
+        if "no valid openpgp data" in t or "not a valid" in t or "unknown system error" in t:
+            return "el contenido no es un GPG válido (¿texto plano sin cifrar, vacío o truncado?)"
+        lineas = [l.strip() for l in stderr.splitlines() if l.strip()]
+        return lineas[-1] if lineas else "error desconocido de gpg"
+
     def _gpg_decrypt_to_tmp(self, path: Path) -> Path:
         inner_ext = Path(path.stem).suffix or ".bin"
         tmp = tempfile.NamedTemporaryFile(suffix=inner_ext, delete=False)
@@ -624,12 +772,119 @@ class ByteStorage:
         tmp_path = Path(tmp.name)
         res = subprocess.run(
             ["gpg", "--yes", "--batch", "-o", str(tmp_path), "-d", str(path)],
-            capture_output=True
+            capture_output=True, env={**os.environ, "LC_ALL": "C"}
         )
         if res.returncode != 0:
             tmp_path.unlink()
             raise RuntimeError(res.stderr.decode())
         return tmp_path
+
+    # --- destinatarios GPG: el archivo .gpg es la fuente de verdad ---
+    # El registro (.byte/byte.json) solo guarda una copia de los destinatarios.
+    # Si el .gpg llega por otra vía (scp, link, otro equipo) esa copia queda
+    # desactualizada, y al re-cifrar se usarían destinatarios equivocados.
+    @staticmethod
+    def _gpg_ids_de_archivo(path: Path) -> Set[str]:
+        """keyids (16 hex) de los destinatarios de un .gpg, sin descifrar."""
+        res = subprocess.run(["gpg", "--batch", "--list-packets", str(path)],
+                             capture_output=True)
+        texto = res.stdout.decode(errors="replace") + res.stderr.decode(errors="replace")
+        ids: Set[str] = set()
+        for linea in texto.splitlines():
+            if "pubkey enc packet" not in linea:
+                continue
+            m = re.search(r"keyid\s+([0-9A-Fa-f]{16})", linea)
+            if m and set(m.group(1)) != {"0"}:   # 0000… = destinatario oculto
+                ids.add(m.group(1).upper())
+        return ids
+
+    @staticmethod
+    def _gpg_ids_de_clave(spec: str) -> Set[str]:
+        """keyids (principal y subclaves) de la clave que designa spec (email, etc.)."""
+        res = subprocess.run(["gpg", "--batch", "--list-keys", "--with-colons", "--", spec],
+                             capture_output=True)
+        if res.returncode != 0:
+            return set()
+        ids: Set[str] = set()
+        for linea in res.stdout.decode(errors="replace").splitlines():
+            f = linea.split(":")
+            if f[0] in ("pub", "sub") and len(f) > 4 and f[4]:
+                ids.add(f[4].upper())
+        return ids
+
+    @staticmethod
+    def _gpg_mapa_llavero() -> Dict[str, str]:
+        """keyid (principal o subclave) → email del llavero local."""
+        res = subprocess.run(["gpg", "--batch", "--list-keys", "--with-colons"],
+                             capture_output=True)
+        mapa: Dict[str, str] = {}
+        bloque: List[str] = []
+        etiqueta: Optional[str] = None
+
+        def cerrar() -> None:
+            for k in bloque:
+                mapa[k] = etiqueta or k
+
+        for linea in res.stdout.decode(errors="replace").splitlines():
+            f = linea.split(":")
+            if f[0] == "pub":
+                cerrar()
+                bloque = [f[4].upper()]
+                etiqueta = None
+            elif f[0] == "sub" and len(f) > 4:
+                bloque.append(f[4].upper())
+            elif f[0] == "uid" and etiqueta is None and len(f) > 9:
+                m = re.search(r"<([^>]+)>", f[9])
+                etiqueta = m.group(1) if m else f[9]
+        cerrar()
+        return mapa
+
+    def sincronizar_destinatarios(self, grupo: str, stem: str) -> Optional[Tuple[str, str]]:
+        """Actualiza en el registro los destinatarios de una entrada .gpg a partir
+        del propio archivo. Devuelve (antes, después) si hubo cambio. No toca nada
+        si algún destinatario del archivo no se puede identificar en este llavero."""
+        ev = self.get_entrada_path(grupo, stem)
+        if not ev or ev.suffix.lower() != ".gpg" or not ev.is_file() or not shutil.which("gpg"):
+            return None
+        try:
+            mtime = ev.stat().st_mtime
+        except OSError:
+            return None
+        if self._gpg_sync_cache.get(ev) == mtime:
+            return None
+        self._gpg_sync_cache[ev] = mtime
+        archivo_ids = self._gpg_ids_de_archivo(ev)
+        if not archivo_ids:
+            return None
+        registrado = self.registry.key_id(grupo, stem) or ""
+        tokens = [t.strip() for t in registrado.split(",") if t.strip()]
+        ids_token = {t: self._gpg_ids_de_clave(t) for t in tokens}
+        validos = [t for t in tokens if ids_token[t] & archivo_ids]
+        cubiertos: Set[str] = set()
+        for t in validos:
+            cubiertos |= ids_token[t]
+        if len(validos) == len(tokens) and archivo_ids <= cubiertos:
+            return None   # el registro ya coincide con el archivo
+        mapa = self._gpg_mapa_llavero()
+        nuevos: List[str] = []
+        for k in sorted(archivo_ids - cubiertos):
+            etiqueta = mapa.get(k)
+            if etiqueta is None:
+                return None   # destinatario que no se puede nombrar aquí
+            if etiqueta not in nuevos and etiqueta not in validos:
+                nuevos.append(etiqueta)
+        nueva = ",".join(validos + nuevos)
+        if not nueva or nueva == registrado:
+            return None
+        self.registry.mark_gpg(grupo, stem, nueva)
+        print(f"  {C('warn')}~{C('rst')} {grupo}/{stem}: {C('date')}destinatarios GPG actualizados desde el archivo: "
+              f"{registrado or '(vacío)'} → {nueva}{C('rst')}", file=sys.stderr)
+        return registrado, nueva
+
+    def key_id_vigente(self, grupo: str, stem: str) -> Optional[str]:
+        """Destinatarios GPG de la entrada, sincronizados antes con el archivo."""
+        self.sincronizar_destinatarios(grupo, stem)
+        return self.registry.key_id(grupo, stem)
 
     # --- versionado ---
     def guardar_version(self, grupo: str, stem: str) -> Optional[Path]:
@@ -659,7 +914,7 @@ class ByteStorage:
         if not ev_path:
             ev_path = self.entrada_path(grupo, stem, ext=version_path.suffix)
         contenido = version_path.read_bytes()
-        key_id = self.registry.key_id(grupo, stem) if self.registry.is_protected(grupo, stem) else None
+        key_id = self.key_id_vigente(grupo, stem) if self.registry.is_protected(grupo, stem) else None
         self.escribir_entrada(grupo, stem, contenido, key_id=key_id, cifrar=bool(key_id))
         return True
 
@@ -672,6 +927,11 @@ class ByteInterface:
         self.registry = storage.registry
         self.columnas_default = columnas_default
         self._persistent_cache: Dict = self.registry.get_abbr_cache()
+        # Cache en memoria de abreviaturas de GRUPO (no se persiste en disco:
+        # es barata de recalcular y cambia poco, pero antes se recomputaba
+        # en cada llamada a render_ruta(), una vez por línea impresa).
+        self._grupo_abbr_cache: Dict[str, str] = {}
+        self._grupo_abbr_cache_key: Optional[Tuple[str, ...]] = None
 
     def _get_abreviaturas(self, grupo: str, long: int = 2) -> Dict[str, str]:
         if long != 2:
@@ -689,6 +949,19 @@ class ByteInterface:
             self.registry.set_abbr_cache(self._persistent_cache)
         return abbr
 
+    def _get_abreviaturas_grupos(self, long: int = 3) -> Dict[str, str]:
+        """Cache en memoria (por proceso) de las abreviaturas de grupo.
+        Se invalida solo si cambia la lista de grupos, evitando recalcular
+        calc_abreviaturas() en cada render_ruta()."""
+        grupos = self.storage.get_grupos()
+        firma = tuple(grupos)
+        if self._grupo_abbr_cache_key == firma:
+            return self._grupo_abbr_cache
+        abbr = self.calc_abreviaturas(grupos, long)
+        self._grupo_abbr_cache = abbr
+        self._grupo_abbr_cache_key = firma
+        return abbr
+
     def update_all_abbreviations(self) -> None:
         self._persistent_cache = {}
         for grupo in self.storage.get_grupos():
@@ -698,6 +971,9 @@ class ByteInterface:
             if gp.is_dir():
                 self._persistent_cache[grupo] = {"mtime": gp.stat().st_mtime, "abbr": abbr}
         self.registry.set_abbr_cache(self._persistent_cache)
+        # Los grupos pudieron cambiar (crearse/eliminarse) durante el check;
+        # invalidamos también el cache de abreviaturas de grupo.
+        self._grupo_abbr_cache_key = None
 
     def invalidar_cache_abreviaturas(self, grupo: Optional[str] = None) -> None:
         if grupo is None:
@@ -705,6 +981,8 @@ class ByteInterface:
         else:
             self._persistent_cache.pop(grupo, None)
         self.registry.set_abbr_cache(self._persistent_cache)
+        # Un rename/mv/del de grupo también puede afectar la lista de grupos.
+        self._grupo_abbr_cache_key = None
 
     def leer(self, prompt: str) -> str:
         try:
@@ -713,9 +991,18 @@ class ByteInterface:
             print(f"\n  {C('tree')}(Interrumpido){C('rst')}")
             sys.exit(0)
 
+    def leer_secreto(self, prompt: str) -> str:
+        """Lee una contraseña sin mostrarla en pantalla."""
+        try:
+            return getpass.getpass(prompt)
+        except (KeyboardInterrupt, EOFError):
+            print(f"\n  {C('tree')}(Interrumpido){C('rst')}")
+            sys.exit(0)
+
     def calc_abreviaturas(self, lista: List[str], long: int) -> Dict[str, str]:
         max_long = max(long, 5)
         resultado: Dict[str, str] = {}
+        usados: set = set()
         for item in sorted(lista, key=len):
             encontrado = None
             for l in range(long, max_long + 1):
@@ -725,7 +1012,7 @@ class ByteInterface:
                     sub = item[i:i+l]
                     if ' ' in sub:
                         continue
-                    if sub not in resultado.values():
+                    if sub not in usados:
                         encontrado = sub
                         break
                 if encontrado:
@@ -734,13 +1021,13 @@ class ByteInterface:
                 letras = [c for c in item if not c.isspace()]
                 if len(letras) >= 2:
                     sub = letras[0] + letras[-1]
-                    if sub not in resultado.values():
+                    if sub not in usados:
                         encontrado = sub
                     else:
                         for i in range(len(letras)-1):
                             for j in range(i+1, len(letras)):
                                 sub = letras[i] + letras[j]
-                                if sub not in resultado.values():
+                                if sub not in usados:
                                     encontrado = sub
                                     break
                             if encontrado:
@@ -750,16 +1037,17 @@ class ByteInterface:
                     for c1 in string.ascii_lowercase:
                         for c2 in string.ascii_lowercase:
                             sub = c1 + c2
-                            if sub not in resultado.values():
+                            if sub not in usados:
                                 encontrado = sub
                                 break
                         if encontrado:
                             break
             resultado[item] = encontrado or item[:max_long]
+            usados.add(resultado[item])
         return {item: resultado[item] for item in lista}
 
     def render_ruta(self, grupo: str, stem: str) -> str:
-        g_abbr = self.calc_abreviaturas(self.storage.get_grupos(), 3)
+        g_abbr = self._get_abreviaturas_grupos(3)
         g_render = _resaltar(grupo, g_abbr.get(grupo), 3, C("group"), C("bold"))
         evs = self.storage.get_entradas(grupo)
         if stem not in evs:
@@ -774,6 +1062,35 @@ class ByteInterface:
         p = Path(path_str)
         parts = p.parts
         return f"…/{parts[-2]}/{parts[-1]}" if len(parts) >= 2 else path_str
+
+    def print_dos_columnas(self, titulo_izq: str, lineas_izq: List[str],
+                           titulo_der: str, lineas_der: List[str],
+                           indent: str = "  ") -> None:
+        """Imprime dos bloques (título + líneas) lado a lado — todo lo de
+        'Vault' de un lado, todo lo de 'Externo' del otro. Si no entran en
+        el ancho de la terminal, cae a formato apilado en vez de cortar.
+        Los anchos se miden sin contar las secuencias ANSI."""
+        h, d, r = C("header"), C("date"), C("rst")
+        ancho_izq = max([len(strip_ansi(titulo_izq))] + [len(strip_ansi(l)) for l in lineas_izq], default=0)
+        ancho_der = max([len(strip_ansi(titulo_der))] + [len(strip_ansi(l)) for l in lineas_der], default=0)
+        sep = "   "
+        term_width = shutil.get_terminal_size().columns
+        if len(indent) + ancho_izq + len(sep) + ancho_der > term_width:
+            print(f"{indent}{h}{titulo_izq}{r}")
+            for l in lineas_izq:
+                print(f"{indent}  {l}")
+            print(f"{indent}{h}{titulo_der}{r}")
+            for l in lineas_der:
+                print(f"{indent}  {l}")
+            return
+        relleno = " " * (ancho_izq - len(strip_ansi(titulo_izq)))
+        print(f"{indent}{h}{titulo_izq}{r}{relleno}{sep}{h}{titulo_der}{r}")
+        print(f"{indent}{d}{'-' * ancho_izq}{sep}{'-' * ancho_der}{r}")
+        max_filas = max(len(lineas_izq), len(lineas_der))
+        for i in range(max_filas):
+            li = lineas_izq[i] if i < len(lineas_izq) else ""
+            ld = lineas_der[i] if i < len(lineas_der) else ""
+            print(f"{indent}{pad_ansi(li, ancho_izq)}{sep}{ld}")
 
     def _get_badges_compactos(self, grupo: str, stem: str) -> str:
         r = self.storage.registry
@@ -849,20 +1166,7 @@ class ByteInterface:
             print("  (vacío)")
             return
         term_width = shutil.get_terminal_size().columns
-        g_abbr_tmp = self.calc_abreviaturas(grupos, 3)
-
-        def ancho_grupo(grupo: str, evs: List[str]) -> int:
-            e_abbr = self._get_abreviaturas(grupo)
-            header = f"{_resaltar(grupo, g_abbr_tmp.get(grupo), 3, C('group'), C('bold'))} {C('date')}({len(evs)}){C('rst')}"
-            max_ancho = len(strip_ansi(header))
-            for stem in evs:
-                if filter_func and not filter_func(grupo, stem):
-                    continue
-                ev_path = self.storage.get_entrada_path(grupo, stem)
-                linea = self._render_entrada_linea(grupo, stem, ev_path, e_abbr, compact=True,
-                                                   show_info_text=show_info_text)
-                max_ancho = max(max_ancho, len(strip_ansi(linea)))
-            return max_ancho
+        g_abbr_tmp = self._get_abreviaturas_grupos(3)
 
         grupos_data = []
         for g in grupos:
@@ -876,7 +1180,26 @@ class ByteInterface:
             print("  (vacío)")
             return
 
-        anchos = [ancho_grupo(g, evs) + 2 for g, evs in grupos_data]
+        # Renderiza cada grupo (encabezado + líneas) UNA sola vez y de paso calcula
+        # su ancho de columna, en lugar de renderizar dos veces por entrada
+        # (antes: una para medir en ancho_grupo() y otra para imprimir).
+        render_cache: Dict[str, List[str]] = {}
+        anchos: List[int] = []
+        for grupo, evs in grupos_data:
+            e_abbr = self._get_abreviaturas(grupo)
+            paths_map = self.storage.get_entrada_paths_map(grupo)
+            header = f"{_resaltar(grupo, g_abbr_tmp.get(grupo), 3, C('group'), C('bold'))} {C('date')}({len(evs)}){C('rst')}"
+            lineas = [header]
+            max_ancho = len(strip_ansi(header))
+            for stem in evs:
+                ev_path = paths_map.get(stem)
+                linea = self._render_entrada_linea(grupo, stem, ev_path, e_abbr, compact=True,
+                                                   show_info_text=show_info_text)
+                lineas.append(linea)
+                max_ancho = max(max_ancho, len(strip_ansi(linea)))
+            render_cache[grupo] = lineas
+            anchos.append(max_ancho + 2)
+
         n_cols = len(grupos_data)
         while n_cols > 1 and sum(anchos[:n_cols]) > term_width:
             n_cols -= 1
@@ -884,16 +1207,7 @@ class ByteInterface:
         anchos_en_filas = [anchos[i:i+n_cols] for i in range(0, len(anchos), n_cols)]
         sep = "  "
         for fila_grupos, fila_anchos in zip(grupos_en_filas, anchos_en_filas):
-            columnas: List[List[str]] = []
-            for (grupo, evs), ancho in zip(fila_grupos, fila_anchos):
-                e_abbr = self._get_abreviaturas(grupo)
-                header = f"{_resaltar(grupo, g_abbr_tmp.get(grupo), 3, C('group'), C('bold'))} {C('date')}({len(evs)}){C('rst')}"
-                lineas = [header]
-                for stem in evs:
-                    ev_path = self.storage.get_entrada_path(grupo, stem)
-                    lineas.append(self._render_entrada_linea(grupo, stem, ev_path, e_abbr, compact=True,
-                                                             show_info_text=show_info_text))
-                columnas.append(lineas)
+            columnas: List[List[str]] = [render_cache[grupo] for grupo, _ in fila_grupos]
             max_filas = max(len(col) for col in columnas)
             for fi in range(max_filas):
                 partes = []
@@ -916,7 +1230,7 @@ class ByteInterface:
             print("  (vacío)")
             return
         d, r = C("date"), C("rst")
-        g_abbr_tmp = self.calc_abreviaturas(grupos, 3)
+        g_abbr_tmp = self._get_abreviaturas_grupos(3)
         for gi, grupo in enumerate(grupos):
             evs = self.storage.get_entradas(grupo)
             if filter_func:
@@ -928,8 +1242,9 @@ class ByteInterface:
             grupo_render = _resaltar(grupo, g_abbr_tmp.get(grupo), 3, C("group"), C("bold"))
             print(f"{C('tree')}{grupo_render} {d}({len(evs)}){r}")
             e_abbr = self._get_abreviaturas(grupo)
+            paths_map = self.storage.get_entrada_paths_map(grupo)
             for stem in evs:
-                ev_path = self.storage.get_entrada_path(grupo, stem)
+                ev_path = paths_map.get(stem)
                 line = self._render_entrada_linea(grupo, stem, ev_path, e_abbr, compact=False,
                                                   show_info_text=show_info_text)
                 if show_dates:
@@ -949,7 +1264,7 @@ class ByteInterface:
                 return ""
             if res in grupos:
                 return res
-            g_abbr = self.calc_abreviaturas(grupos, 3)
+            g_abbr = self._get_abreviaturas_grupos(3)
             for g, ab in g_abbr.items():
                 if ab.lower() == res.lower():
                     return g
@@ -997,7 +1312,7 @@ class ByteApp:
         grupos = self.storage.get_grupos()
         if token in grupos:
             return token
-        g_abbr = self.ui.calc_abreviaturas(grupos, 3)
+        g_abbr = self.ui._get_abreviaturas_grupos(3)
         for g, ab in g_abbr.items():
             if ab.lower() == token.lower():
                 return g
@@ -1081,21 +1396,35 @@ class ByteApp:
         return None
 
     async def mostrar_diff_async(self, a: Path, b: Path,
-                                  label_a: str = "entrada (vault)",
-                                  label_b: str = "origen") -> None:
+                                  label_a: str = "Vault",
+                                  label_b: str = "Externo",
+                                  nombre_a: Optional[str] = None,
+                                  nombre_b: Optional[str] = None) -> None:
+        d, r, w = C("date"), C("rst"), C("warn")
         proc = await async_run("diff", "-u",
                                "-L", label_a,
                                "-L", label_b,
-                               str(a), str(b))
+                               str(a), str(b),
+                               env={**os.environ, "LC_ALL": "C"})
         if not proc._stdout_data.strip():
-            print("  (sin diferencias)")
+            print(f"  {d}(sin diferencias){r}")
             return
         tool = await self._diff_tool_async()
         diff_text = proc._stdout_data
+        primera = diff_text.split(b"\n", 1)[0]
+        if primera.endswith(b" differ") and primera.startswith((b"Binary files", b"Files ")):
+            print(f"  {w}(archivos binarios distintos: no se puede mostrar el diff){r}")
+            return
+        if nombre_a and nombre_b:
+            if tool == "delta":
+                print(f"  {d}izquierda = {nombre_a}   ·   derecha = {nombre_b}{r}")
+            else:
+                print(f"  {d}-  solo en {nombre_a}   ·   +  solo en {nombre_b}{r}")
         if tool == "delta":
-            delta_args = ["delta", "--paging=never"]
-            if shutil.get_terminal_size().columns >= 160:
-                delta_args.append("--side-by-side")
+            # Siempre lado a lado: todo lo de 'Vault' de un lado, todo lo
+            # de 'Externo' del otro. delta ajusta el ancho de cada panel solo,
+            # incluso en terminales angostas.
+            delta_args = ["delta", "--paging=never", "--side-by-side"]
             p = await asyncio.create_subprocess_exec(
                 *delta_args,
                 stdin=asyncio.subprocess.PIPE,
@@ -1115,15 +1444,127 @@ class ByteApp:
             print(diff_text.decode(errors="replace"), end="")
 
     async def mostrar_diff_remoto_async(self, local: Path, contenido_remoto: bytes,
-                                         label_a: str = "entrada (vault)",
-                                         label_b: str = "origen") -> None:
+                                         label_a: str = "Vault",
+                                         label_b: str = "Externo",
+                                         nombre_a: Optional[str] = None,
+                                         nombre_b: Optional[str] = None) -> None:
         with tempfile.NamedTemporaryFile(mode='wb', suffix='.tmp', delete=False) as tf:
             tf.write(contenido_remoto)
             tmp = Path(tf.name)
         try:
-            await self.mostrar_diff_async(local, tmp, label_a=label_a, label_b=label_b)
+            await self.mostrar_diff_async(local, tmp, label_a=label_a, label_b=label_b,
+                                          nombre_a=nombre_a, nombre_b=nombre_b)
         finally:
             tmp.unlink()
+
+    async def _descifrar_externo(self, src_str: str, raw: bytes) -> bytes:
+        """Descifra el contenido de un Externo cifrado.
+        1) con las claves de este equipo; 2) si no se puede y hay terminal, pregunta:
+        descifrar EN el servidor (pide la contraseña de la clave de allí) o, si el
+        problema fue pedir la contraseña, introducirla aquí. Lanza RuntimeError si no."""
+        d, r, w = C("date"), C("rst"), C("warn")
+        try:
+            return self.storage.gpg_descifrar_bytes(raw)
+        except RuntimeError as e:
+            err = e
+        motivo = self.storage.gpg_explicar_error(str(err))
+        texto_plano = raw.strip() and es_texto_bytes(raw) \
+            and not raw.lstrip().startswith(b"-----BEGIN PGP")
+        if not raw or texto_plano or not sys.stdin.isatty():
+            raise err
+        cache = self.__dict__.setdefault("_pass_cache", {})
+
+        async def intentar(clave: str, etiqueta: str, descifrar) -> Optional[bytes]:
+            for _ in range(3):
+                pw = cache.get(clave)
+                if pw is None:
+                    pw = self.ui.leer_secreto(f"  Contraseña de la clave GPG {etiqueta} ({d}vacío = sin contraseña{r}): ")
+                try:
+                    datos = await descifrar(pw)
+                    cache[clave] = pw
+                    return datos
+                except RuntimeError as e2:
+                    cache.pop(clave, None)
+                    m2 = self.storage.gpg_explicar_error(str(e2))
+                    print(f"  {w}{m2}{r}")
+                    if "contraseña" not in m2:
+                        return None
+            return None
+
+        if es_remoto(src_str):
+            host = remote_parse(src_str)[0]
+            print(f"  {w}No se pudo descifrar aquí: {motivo}{r}")
+            if self.ui.leer(f"  ¿Descifrar en {host}? Pedirá la contraseña de la clave de allí (s/{d}N{r}): ").lower() == "s":
+                datos = await intentar(host, f"en {host}",
+                                       lambda pw: remote_gpg_descifrar_async(src_str, pw))
+                if datos is not None:
+                    return datos
+        elif "contraseña" in motivo:
+            print(f"  {w}No se pudo descifrar: {motivo}{r}")
+            if self.ui.leer(f"  ¿Introducir la contraseña aquí? (s/{d}N{r}): ").lower() == "s":
+                async def local(pw: str) -> bytes:
+                    return self.storage.gpg_descifrar_bytes(raw, pw)
+                datos = await intentar("local", "local", local)
+                if datos is not None:
+                    return datos
+        raise err
+
+    async def _diff_vault_externo(self, ev_path: Path, src_str: str,
+                                  contenido_remoto: Optional[bytes] = None,
+                                  label_a: str = "VAULT",
+                                  label_b: str = "EXTERNO",
+                                  ev_plano: Optional[bytes] = None,
+                                  ext_plano: Optional[bytes] = None) -> None:
+        """Diff Vault ↔ Externo en texto plano: descifra el lado que esté cifrado
+        (.gpg) antes de comparar. Si alguno es binario, avisa en vez de mostrar diff."""
+        d, r, w = C("date"), C("rst"), C("warn")
+        tmps: List[Path] = []
+        try:
+            if ev_plano is None:
+                if ev_path.suffix.lower() == ".gpg":
+                    t = self.storage._gpg_decrypt_to_tmp(ev_path)
+                    ev_plano = t.read_bytes()
+                    t.unlink()
+                else:
+                    ev_plano = ev_path.read_bytes()
+            if ext_plano is None:
+                if es_remoto(src_str):
+                    raw = contenido_remoto if contenido_remoto is not None \
+                        else await remote_read_async(src_str)
+                else:
+                    raw = Path(src_str).read_bytes()
+                ext_plano = await self._descifrar_externo(src_str, raw) \
+                    if externo_es_cifrado(src_str, raw[:64]) else raw
+            if not (es_texto_bytes(ev_plano) and es_texto_bytes(ext_plano)):
+                print(f"  {w}Contenido binario: no se puede mostrar un diff de texto.{r}")
+                return
+            for datos in (ev_plano, ext_plano):
+                tf = tempfile.NamedTemporaryFile(delete=False)
+                tf.write(datos)
+                tf.close()
+                tmps.append(Path(tf.name))
+            await self.mostrar_diff_async(tmps[0], tmps[1], label_a=label_a, label_b=label_b,
+                                          nombre_a="Vault", nombre_b="Externo")
+        except Exception as e:
+            print(f"  {w}No se pudo mostrar el diff: {e}{r}")
+        finally:
+            for t in tmps:
+                t.unlink(missing_ok=True)
+
+    def _bytes_para_externo(self, g: str, stem: str, ev_path: Path,
+                            ext_cifrado: bool) -> Optional[bytes]:
+        """Qué se escribe en Externo: si Externo es un .gpg, el .gpg del Vault tal cual
+        (cifrado, mismos destinatarios); si no, el contenido en claro."""
+        w, r = C("warn"), C("rst")
+        if ext_cifrado:
+            if ev_path.suffix.lower() != ".gpg":
+                print(f"  {w}Externo es cifrado (.gpg) pero el Vault no: cifra antes la entrada con b --gpg.{r}")
+                return None
+            return ev_path.read_bytes()
+        contenido = self.storage.leer_entrada(g, stem)
+        if contenido is None:
+            print(f"  {w}Error al leer la entrada del Vault{r}")
+        return contenido
 
     def _listar_enlaces(self) -> None:
         """Muestra todas las entradas que tienen al menos un enlace, respetando la vista."""
@@ -1211,7 +1652,7 @@ class ByteApp:
                     tmp.unlink()
                     return
                 tmp.write_text(contenido_actual + linea, encoding="utf-8")
-                key_id = self.storage.registry.key_id(grupo, stem)
+                key_id = self.storage.key_id_vigente(grupo, stem)
                 if not key_id:
                     print(f"{C('warn')}No hay clave GPG registrada.{C('rst')}")
                     tmp.unlink()
@@ -1268,7 +1709,7 @@ class ByteApp:
             mtime_antes = tmp.stat().st_mtime
             subprocess.run([self.config.editor, str(tmp)])
             if tmp.stat().st_mtime != mtime_antes:
-                key_id = self.storage.registry.key_id(grupo, stem)
+                key_id = self.storage.key_id_vigente(grupo, stem)
                 try:
                     self.storage.escribir_entrada(grupo, stem, tmp.read_bytes(), key_id=key_id, cifrar=True)
                     print(f"{C('count')}~ {ruta_fmt}{C('rst')} (cifrado)")
@@ -1316,8 +1757,7 @@ class ByteApp:
         if es_remoto(src_str):
             user_host, path = remote_parse(src_str)
             if path.startswith('~'):
-                user = user_host.split('@')[0] if '@' in user_host else user_host
-                home = '/root' if user == 'root' else f'/home/{user}'
+                home = await remote_home_async(user_host)
                 path = path.replace('~', home, 1)
                 src_str = (f"ssh://{user_host}{path}" if src_str.startswith('ssh://')
                            else f"{user_host}:{path}")
@@ -1384,13 +1824,12 @@ class ByteApp:
 
         # Casos src_exists / ev_exists
         if not src_exists and ev_exists:
-            print(f"{C('date')}  El archivo externo no existe, se creará desde el vault.{C('rst')}")
+            print(f"{C('date')}  Externo no existe, se creará desde Vault.{C('rst')}")
             prompt = f"  Crear {src_str} desde {grupo}/{stem}? (s/{C('date')}N{C('rst')}): "
             if self.ui.leer(prompt).lower() != 's':
                 return
-            contenido = self.storage.leer_entrada(grupo, stem)
+            contenido = self._bytes_para_externo(grupo, stem, ev_path, externo_es_cifrado(src_str))
             if contenido is None:
-                print("  Error al leer la entrada")
                 return
             if es_remoto(src_str):
                 await remote_write_async(src_str, contenido)
@@ -1406,7 +1845,7 @@ class ByteApp:
             return
 
         if src_exists and not ev_exists:
-            print(f"{C('date')}  La entrada {grupo}/{stem} no existe, se creará desde el archivo externo.{C('rst')}")
+            print(f"{C('date')}  {grupo}/{stem} no existe en Vault, se creará desde Externo.{C('rst')}")
             prompt = f"  Crear {grupo}/{stem} desde {src_str}? (s/{C('date')}N{C('rst')}): "
             if self.ui.leer(prompt).lower() != 's':
                 return
@@ -1444,18 +1883,23 @@ class ByteApp:
             print(f"    Vault: {ev_path}")
             print(f"    Externo: {src_str}")
             while True:
-                op = self.ui.leer("  [e]ntrada→origen, [o]rigen→entrada, [a]ñadir, [d]iff, [n]ada: ").lower()
+                op = self.ui.leer("  [v]ault→externo, [e]xterno→vault, [a]ñadir, [d]iff, [n]ada: ").lower()
                 if op == 'd':
+                    fmt_t = "%Y-%m-%d %H:%M"
+                    mtime_ev = datetime.fromtimestamp(ev_path.stat().st_mtime).strftime(fmt_t)
                     if es_remoto(src_str):
-                        contenido_remoto = await remote_read_async(src_str)
-                        await self.mostrar_diff_remoto_async(ev_path, contenido_remoto)
+                        label_ext = "EXTERNO"
                     else:
-                        await self.mostrar_diff_async(ev_path, Path(src_str))
+                        mtime_ext = datetime.fromtimestamp(Path(src_str).stat().st_mtime).strftime(fmt_t)
+                        label_ext = f"EXTERNO  {mtime_ext}"
+                    await self._diff_vault_externo(ev_path, src_str,
+                                                   label_a=f"VAULT    {mtime_ev}",
+                                                   label_b=label_ext)
                     continue
-                if op == 'e':
-                    if self.ui.leer(f"  ¿Sobrescribir {src_str} con la entrada? (s/{C('date')}N{C('rst')}): ").lower() != 's':
+                if op == 'v':
+                    if self.ui.leer(f"  ¿Sobrescribir Externo ({src_str}) con Vault? (s/{C('date')}N{C('rst')}): ").lower() != 's':
                         continue
-                    contenido = self.storage.leer_entrada(grupo, stem)
+                    contenido = self._bytes_para_externo(grupo, stem, ev_path, externo_es_cifrado(src_str))
                     if contenido is not None:
                         if es_remoto(src_str):
                             await remote_write_async(src_str, contenido)
@@ -1464,14 +1908,20 @@ class ByteApp:
                         self.storage.registry.add_origin(grupo, stem, src_str)
                         print(f"{C('plus')}✓ {self.ui.render_ruta(grupo, stem)} → {src_str}{C('rst')}")
                     break
-                if op == 'o':
-                    if self.ui.leer(f"  ¿Sobrescribir la entrada con {src_str}? (s/{C('date')}N{C('rst')}): ").lower() != 's':
+                if op == 'e':
+                    if self.ui.leer(f"  ¿Sobrescribir Vault con Externo ({src_str})? (s/{C('date')}N{C('rst')}): ").lower() != 's':
                         continue
                     if es_remoto(src_str):
                         contenido = await remote_read_async(src_str)
                     else:
                         contenido = Path(src_str).read_bytes()
-                    key_id = self.storage.registry.key_id(grupo, stem) if self.storage.registry.is_protected(grupo, stem) else None
+                    if externo_es_cifrado(src_str, contenido[:64]):
+                        try:
+                            contenido = await self._descifrar_externo(src_str, contenido)
+                        except RuntimeError as e:
+                            print(f"{C('warn')}  No se pudo descifrar Externo: {self.storage.gpg_explicar_error(str(e))}{C('rst')}")
+                            continue
+                    key_id = self.storage.key_id_vigente(grupo, stem) if self.storage.registry.is_protected(grupo, stem) else None
                     self.storage.escribir_entrada(grupo, stem, contenido, key_id=key_id, cifrar=bool(key_id))
                     self.storage.registry.add_origin(grupo, stem, src_str)
                     self.storage.registry.set_type(grupo, stem, detectar_tipo_archivo(ev_path))
@@ -1488,7 +1938,7 @@ class ByteApp:
                 print("  Opción no válida.")
             return
 
-        print(f"{C('minus')}  Ni el externo ni la entrada existen.{C('rst')}")
+        print(f"{C('minus')}  Ni Externo ni Vault existen.{C('rst')}")
 
     def cmd_unlink(self, args: List[str]) -> None:
         if not args:
@@ -1661,7 +2111,7 @@ class ByteApp:
         self.storage.registry.rename_links(grupo, origen, grupo, destino)
         self.storage.registry.rename_info(grupo, origen, grupo, destino)
         if self.storage.registry.is_protected(grupo, origen):
-            self.storage.registry.mark_gpg(grupo, destino, self.storage.registry.key_id(grupo, origen))
+            self.storage.registry.mark_gpg(grupo, destino, self.storage.key_id_vigente(grupo, origen))
             self.storage.registry.unmark_gpg(grupo, origen)
         self.storage._invalidar_cache_grupo(grupo)
         self.ui.invalidar_cache_abreviaturas(grupo)
@@ -1691,7 +2141,7 @@ class ByteApp:
         if tipo:
             self.storage.registry.set_type(g_dest, e_dest, tipo)
         if self.storage.registry.is_protected(g_src, e_src):
-            self.storage.registry.mark_gpg(g_dest, e_dest, self.storage.registry.key_id(g_src, e_src))
+            self.storage.registry.mark_gpg(g_dest, e_dest, self.storage.key_id_vigente(g_src, e_src))
             self.storage.registry.unmark_gpg(g_src, e_src)
         for g in (g_src, g_dest):
             self.storage._invalidar_cache_grupo(g)
@@ -1725,7 +2175,7 @@ class ByteApp:
         else:
             self.storage.registry.remove_info(g_src, e_src)
         if self.storage.registry.is_protected(g_src, e_src) and not self.storage.registry.is_protected(g_dest, e_dest):
-            self.storage.registry.mark_gpg(g_dest, e_dest, self.storage.registry.key_id(g_src, e_src))
+            self.storage.registry.mark_gpg(g_dest, e_dest, self.storage.key_id_vigente(g_src, e_src))
         self.storage.registry.unmark_gpg(g_src, e_src)
         p_src.unlink()
         for g in (g_src, g_dest):
@@ -1824,7 +2274,7 @@ class ByteApp:
         ya_cifrado = ev_path and ev_path.suffix.lower() == ".gpg"
         d, r, w = C("date"), C("rst"), C("warn")
         if ya_cifrado:
-            key_actual = self.storage.registry.key_id(grupo, stem) or self.config.gpg_key
+            key_actual = self.storage.key_id_vigente(grupo, stem) or self.config.gpg_key
             actuales = [k for k in (key_actual or "").split(",") if k]
             if actuales:
                 print(f"  {w}g{r} destinatarios actuales:")
@@ -1959,10 +2409,16 @@ class ByteApp:
         if self.config.gpg_keys_secondary:
             print(f"Claves GPG secundarias: {', '.join(self.config.gpg_keys_secondary)}")
         print()
-        tipo_cambiado = False
         for g in self.storage.get_grupos():
             for stem in self.storage.get_entradas(g):
-                ev_path = self.storage.get_entrada_path(g, stem)
+                self.storage.sincronizar_destinatarios(g, stem)
+        tipo_cambiado = False
+        # get_entrada_paths_map una vez por grupo en lugar de get_entrada_path
+        # (escaneo lineal del directorio) una vez por entrada dentro del bucle.
+        for g in self.storage.get_grupos():
+            paths_map = self.storage.get_entrada_paths_map(g)
+            for stem in self.storage.get_entradas(g):
+                ev_path = paths_map.get(stem)
                 if not ev_path or ev_path.suffix.lower() == ".gpg":
                     continue
                 tipo_reg = self.storage.registry.get_type(g, stem)
@@ -1979,8 +2435,9 @@ class ByteApp:
             print()
         candidatos = []
         for g in self.storage.get_grupos():
+            paths_map = self.storage.get_entrada_paths_map(g)
             for stem in self.storage.get_entradas(g):
-                ev_path = self.storage.get_entrada_path(g, stem)
+                ev_path = paths_map.get(stem)
                 if not ev_path:
                     continue
                 for origin in self.storage.registry.get_origins(g, stem):
@@ -1990,133 +2447,357 @@ class ByteApp:
             self.ui.update_all_abbreviations()
             print(f"{d}Caché de abreviaturas actualizada.{r}")
             return
+
         async def verificar(g: str, stem: str, ev_path: Path, src_str: str):
-            if not es_remoto(src_str):
-                src = Path(src_str)
-                if not src.is_file():
-                    return g, stem, ev_path, src_str, None, None, None
-                es_gpg = ev_path.suffix.lower() == ".gpg"
-                if es_gpg:
-                    contenido_ev = self.storage.leer_entrada(g, stem)
-                    if contenido_ev is None:
-                        return g, stem, ev_path, src_str, None, None, "gpg_error"
-                    diff = contenido_ev != src.read_bytes()
-                else:
-                    def archivos_iguales(a: Path, b: Path) -> bool:
-                        return a.stat().st_size == b.stat().st_size and calcular_md5(a) == calcular_md5(b)
-                    diff = not archivos_iguales(ev_path, src)
-                return g, stem, ev_path, src_str, diff, None, None
-            else:
+            es_gpg = ev_path.suffix.lower() == ".gpg"
+            remote_data = None
+            raw = None
+            if es_remoto(src_str):
                 try:
                     resultado = await remote_check_async(src_str)
                 except Exception as e:
                     return g, stem, ev_path, src_str, None, None, str(e)
                 if resultado is None:
                     return g, stem, ev_path, src_str, None, None, None
-                mtime_remoto, contenido_remoto = resultado
-                es_gpg = ev_path.suffix.lower() == ".gpg"
-                if es_gpg:
-                    contenido_ev = self.storage.leer_entrada(g, stem)
-                    if contenido_ev is None:
-                        return g, stem, ev_path, src_str, None, None, "gpg_error"
-                    diff = contenido_ev != contenido_remoto
-                else:
-                    diff = ev_path.read_bytes() != contenido_remoto
-                return g, stem, ev_path, src_str, diff, (mtime_remoto, contenido_remoto), None
-        resultados = await asyncio.gather(*[verificar(g, stem, ep, o) for g, stem, ep, o in candidatos])
+                remote_data = resultado
+                raw = resultado[1]
+            else:
+                src = Path(src_str)
+                if not src.is_file():
+                    return g, stem, ev_path, src_str, None, None, None
+            ext_nombre = src_str.lower().endswith((".gpg", ".pgp"))
+            if es_gpg or ext_nombre or (raw is not None and externo_es_cifrado(src_str, raw[:64])):
+                # Con cifrado de por medio se compara el texto descifrado de ambos lados
+                # (el cifrado no es determinista: dos .gpg del mismo texto nunca coinciden).
+                if raw is None:
+                    raw = Path(src_str).read_bytes()
+                ext_cif = externo_es_cifrado(src_str, raw[:64])
+                if es_gpg and ext_cif and raw == ev_path.read_bytes():
+                    # Copia idéntica del .gpg: no hace falta descifrar nada (ni la contraseña).
+                    return g, stem, ev_path, src_str, False, remote_data, None
+                contenido_ev = self.storage.leer_entrada(g, stem)
+                if contenido_ev is None:
+                    motivo = self.storage.gpg_explicar_error(self.storage.ultimo_gpg_error)
+                    return g, stem, ev_path, src_str, None, None, "gpg_error:" + motivo
+                if ext_cif:
+                    try:
+                        raw = self.storage.gpg_descifrar_bytes(raw)
+                    except RuntimeError:
+                        # No se puede comparar el contenido: se trata como "distinto" y se
+                        # decide en la fase interactiva (con el motivo a la vista).
+                        return g, stem, ev_path, src_str, True, remote_data, None
+                return g, stem, ev_path, src_str, contenido_ev != raw, remote_data, None
+            if raw is not None:
+                diff = ev_path.read_bytes() != raw
+            else:
+                def archivos_iguales(a: Path, b: Path) -> bool:
+                    return a.stat().st_size == b.stat().st_size and calcular_md5(a) == calcular_md5(b)
+                diff = not archivos_iguales(ev_path, Path(src_str))
+            return g, stem, ev_path, src_str, diff, remote_data, None
+
+        # Semáforo: acota cuántas conexiones (remotas en particular) se abren
+        # en paralelo. No cambia el resultado, solo evita saturar la red o
+        # abrir demasiados procesos ssh a la vez si hay muchos enlaces.
+        sem = asyncio.Semaphore(4)
+
+        async def verificar_limitado(g: str, stem: str, ev_path: Path, src_str: str):
+            async with sem:
+                return await verificar(g, stem, ev_path, src_str)
+
+        resultados = await asyncio.gather(
+            *[verificar_limitado(g, stem, ep, o) for g, stem, ep, o in candidatos]
+        )
         cambios = []
         for g, stem, ev_path, src_str, diff, remote_data, error in resultados:
-            if error == "gpg_error":
-                print(f"{w}{g}/{stem} — no se pudo descifrar (GPG), omitido.{r}")
+            if error is not None and error.startswith("gpg_error:"):
+                print(f"{w}{g}/{stem} — no se pudo descifrar Vault: {error.split(':', 1)[1]} (omitido){r}")
             elif error is not None:
                 print(f"{w}{g}/{stem} — error: {error}{r}")
             elif diff is None:
-                print(f"{d}{g}/{stem} → origen no disponible: {self.ui._fmt_origin(src_str)} (omitido){r}")
+                print(f"{d}{g}/{stem} → externo no disponible: {self.ui._fmt_origin(src_str)} (omitido){r}")
             elif diff:
                 cambios.append((g, stem, ev_path, src_str, remote_data))
         for g, stem, ev_path, src_str, remote_data in cambios:
             es_gpg = ev_path.suffix.lower() == ".gpg"
+            remoto = es_remoto(src_str)
             ruta_fmt = self.ui.render_ruta(g, stem)
             origen_fmt = self.ui._fmt_origin(src_str)
             gpg_tag = f" {w}g{r}" if es_gpg else ""
-            print(f"\n{C('bold')}{ruta_fmt}{r}{gpg_tag}"
-                  f"  {C('link')}c → {origen_fmt}{r}"
-                  f"  {d}(modificado){r}")
             mtime_ev = datetime.fromtimestamp(ev_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-            if not es_remoto(src_str):
+            if not remoto:
                 mtime_src = datetime.fromtimestamp(Path(src_str).stat().st_mtime).strftime("%Y-%m-%d %H:%M")
                 contenido_remoto_cache = None
+                with open(src_str, "rb") as fh:
+                    cabecera = fh.read(64)
             else:
                 mtime_remoto, contenido_remoto_cache = remote_data
                 mtime_src = datetime.fromtimestamp(mtime_remoto).strftime("%Y-%m-%d %H:%M")
-            print(f"  {d}entrada: {mtime_ev}  |  origen: {mtime_src}{r}")
-            es_bin = (not es_gpg and self.storage.registry.get_type(g, stem) == "binary") or \
-                     (not es_remoto(src_str) and detectar_tipo_archivo(Path(src_str)) == "binary")
-            label_entrada = f"entrada (vault)  {mtime_ev}"
-            label_origen  = f"origen           {mtime_src}"
+                cabecera = contenido_remoto_cache[:64]
+            ext_cifrado = externo_es_cifrado(src_str, cabecera)
+            modo_cifrado = es_gpg or ext_cifrado
+            ev_plano = ext_plano = None
+            falla_ext: Optional[str] = None
+            ext_en_claro = False
+            if modo_cifrado:
+                # Se compara y se opera sobre el texto descifrado de ambos lados.
+                ev_plano = self.storage.leer_entrada(g, stem)
+                if ev_plano is None:
+                    motivo = self.storage.gpg_explicar_error(self.storage.ultimo_gpg_error)
+                    print(f"{ruta_fmt} {w}— no se pudo descifrar Vault: {motivo} (omitido){r}")
+                    continue
+                raw_ext = contenido_remoto_cache if remoto else Path(src_str).read_bytes()
+                try:
+                    ext_plano = await self._descifrar_externo(src_str, raw_ext) if ext_cifrado else raw_ext
+                except RuntimeError as e:
+                    if raw_ext.strip() and es_texto_bytes(raw_ext) \
+                            and not raw_ext.lstrip().startswith(b"-----BEGIN PGP"):
+                        # Se llama .gpg pero contiene texto plano: se compara tal cual.
+                        ext_en_claro = True
+                        ext_plano = raw_ext
+                    elif not raw_ext:
+                        falla_ext = "Externo está vacío (0 bytes)"
+                    else:
+                        falla_ext = self.storage.gpg_explicar_error(str(e))
+                if falla_ext is None:
+                    if ev_plano == ext_plano and not ext_en_claro:
+                        print(f"{ruta_fmt} {d}— iguales al descifrar, nada que hacer.{r}")
+                        continue
+                    es_bin = (self.storage.registry.get_type(g, stem) == "binary"
+                              or not es_texto_bytes(ev_plano) or not es_texto_bytes(ext_plano))
+                else:
+                    es_bin = False
+            else:
+                es_bin = (self.storage.registry.get_type(g, stem) == "binary") or \
+                         (not remoto and detectar_tipo_archivo(Path(src_str)) == "binary")
+            titulo_comp = "Vault ≠ Externo"
+            if falla_ext:
+                titulo_comp = "Vault ≠ Externo, contenido de Externo no comparable"
+            elif ext_en_claro:
+                titulo_comp = "Externo está SIN CIFRAR" + (
+                    "" if ev_plano == ext_plano else ", y su texto difiere del Vault")
+            elif modo_cifrado:
+                titulo_comp = "Vault ≠ Externo, comparados descifrados"
+            print(f"\n{C('bold')}{ruta_fmt}{r}{gpg_tag}  {d}({titulo_comp}){r}")
+            col_v = [ruta_fmt, f"{d}{mtime_ev}{r}"] + ([f"{w}g{r} cifrado"] if es_gpg else [])
+            col_e = [f"{C('link')}{origen_fmt}{r}", f"{d}{mtime_src}{r}"] + (
+                [f"{w}⚠ SIN CIFRAR{r}"] if ext_en_claro else ([f"{w}g{r} cifrado"] if ext_cifrado else []))
+            while len(col_v) < len(col_e):
+                col_v.append("")
+            while len(col_e) < len(col_v):
+                col_e.append("")
+            self.ui.print_dos_columnas("VAULT", col_v, "EXTERNO", col_e)
+            print()
+            if falla_ext:
+                print(f"  {w}No se pudo descifrar Externo: {falla_ext}{r}")
+                print(f"  {d}Sin descifrar no se puede comparar el contenido; guíate por las fechas.{r}")
+                if es_gpg and ext_cifrado:
+                    if self.ui.leer(f"  ¿Sobrescribir Externo con el .gpg del Vault? (s/{d}N{r}): ").lower() == "s":
+                        datos = ev_path.read_bytes()
+                        try:
+                            if remoto:
+                                await remote_write_async(src_str, datos)
+                            else:
+                                Path(src_str).write_bytes(datos)
+                            print(f"{C('plus')}  ✓ Externo actualizado{r}")
+                        except Exception as e:
+                            print(f"Error subiendo: {e}")
+                continue
+            if ext_en_claro:
+                print(f"  {w}⚠ Externo se llama .gpg pero su contenido está en texto plano (sin cifrar).{r}")
+                if ev_plano == ext_plano:
+                    print(f"  {d}El texto es igual al del Vault; solo falta cifrarlo.{r}")
+                    if es_gpg and self.ui.leer(f"  ¿Cifrar Externo ahora (subir el .gpg del Vault)? (s/{d}N{r}): ").lower() == "s":
+                        datos = ev_path.read_bytes()
+                        try:
+                            if remoto:
+                                await remote_write_async(src_str, datos)
+                            else:
+                                Path(src_str).write_bytes(datos)
+                            print(f"{C('plus')}  ✓ Externo cifrado{r}")
+                        except Exception as e:
+                            print(f"Error subiendo: {e}")
+                    continue
+                print(f"  {d}[v] lo reemplaza por el .gpg del Vault (cifrado); [e] trae el texto de Externo al Vault.{r}")
+            if es_bin and modo_cifrado:
+                print(f"  {d}Contenido binario: no se compara como texto; solo [m]d5.{r}")
+            label_vault   = f"VAULT    {mtime_ev}"
+            label_externo = f"EXTERNO  {mtime_src}"
             while True:
                 if es_bin:
-                    res = self.ui.leer("  [o] origen→entrada, [e] entrada→origen, [m]d5, [N]o: ").lower()
+                    res = self.ui.leer("  [v] vault→externo, [e] externo→vault, [m]d5, [N]o: ").lower()
                 else:
-                    res = self.ui.leer("  [o] origen→entrada, [e] entrada→origen, [d]iff, [N]o: ").lower()
+                    res = self.ui.leer("  [v] vault→externo, [e] externo→vault, [f]usionar, [d]iff, [N]o: ").lower()
                 if res == "m" and es_bin:
-                    if es_remoto(src_str):
-                        md5_src = hashlib.md5(contenido_remoto_cache).hexdigest()
+                    if modo_cifrado:
+                        md5_ev = hashlib.md5(ev_plano).hexdigest()
+                        md5_src = hashlib.md5(ext_plano).hexdigest()
                     else:
-                        md5_src = calcular_md5(Path(src_str))
-                    if es_gpg:
-                        tmp = self.storage._gpg_decrypt_to_tmp(ev_path)
-                        md5_ev = calcular_md5(tmp)
-                        tmp.unlink()
-                    else:
+                        md5_src = hashlib.md5(contenido_remoto_cache).hexdigest() if remoto \
+                            else calcular_md5(Path(src_str))
                         md5_ev = calcular_md5(ev_path)
-                    print(f"  MD5 origen: {md5_src}")
-                    print(f"  MD5 entrada: {md5_ev}")
+                    self.ui.print_dos_columnas(
+                        "VAULT", [md5_ev],
+                        "EXTERNO", [md5_src],
+                    )
                 elif res == "d" and not es_bin:
-                    if es_remoto(src_str):
-                        await self.mostrar_diff_remoto_async(
-                            ev_path, contenido_remoto_cache,
-                            label_a=label_entrada,
-                            label_b=label_origen,
-                        )
+                    await self._diff_vault_externo(
+                        ev_path, src_str, contenido_remoto_cache,
+                        label_a=label_vault, label_b=label_externo,
+                        ev_plano=ev_plano, ext_plano=ext_plano,
+                    )
+                elif res == "f" and not es_bin:
+                    if modo_cifrado:
+                        contenido_ev, contenido_origen = ev_plano, ext_plano
                     else:
-                        await self.mostrar_diff_async(
-                            ev_path, Path(src_str),
-                            label_a=label_entrada,
-                            label_b=label_origen,
-                        )
-                elif res == "o":
-                    if es_remoto(src_str):
-                        self.storage.escribir_entrada(g, stem, contenido_remoto_cache, cifrar=bool(es_gpg))
+                        contenido_ev = self.storage.leer_entrada(g, stem)
+                        if contenido_ev is None:
+                            print("Error leyendo entrada")
+                            break
+                        contenido_origen = contenido_remoto_cache if remoto else Path(src_str).read_bytes()
+                    try:
+                        texto_ev = contenido_ev.decode("utf-8")
+                        texto_origen = contenido_origen.decode("utf-8")
+                    except UnicodeDecodeError:
+                        print(f"  {w}No se puede fusionar: contenido no es texto UTF-8 válido.{r}")
+                        break
+                    marcado = (
+                        f"<<<<<<< VAULT {mtime_ev}\n{texto_ev}"
+                        f"=======\n{texto_origen}"
+                        f">>>>>>> EXTERNO {mtime_src}\n"
+                    )
+                    with tempfile.NamedTemporaryFile(
+                        mode="w", suffix=f"_{stem}.merge", delete=False, encoding="utf-8"
+                    ) as tf:
+                        tf.write(marcado)
+                        tmp_path = Path(tf.name)
+                    try:
+                        subprocess.run(shlex.split(self.config.editor) + [str(tmp_path)])
+                        resuelto = tmp_path.read_bytes()
+                    finally:
+                        tmp_path.unlink(missing_ok=True)
+                    if self.ui.leer(f"  ¿Guardar resultado fusionado en Vault? (s/{d}N{r}): ").lower() != "s":
+                        print(f"{d}  Fusión descartada.{r}")
+                        break
+                    key_id = self.storage.key_id_vigente(g, stem) if es_gpg else None
+                    if es_gpg and not key_id:
+                        print(f"  {w}No hay clave GPG registrada para re-cifrar el Vault; fusión no guardada.{r}")
+                        break
+                    self.storage.escribir_entrada(g, stem, resuelto, key_id=key_id, cifrar=bool(es_gpg))
+                    self.storage._invalidar_cache_grupo(g)
+                    self.ui.invalidar_cache_abreviaturas(g)
+                    if not es_gpg:
+                        self.storage.registry.set_type(g, stem, detectar_tipo_archivo(ev_path))
+                    print(f"{C('plus')}  ✓ Vault actualizado con fusión{r}")
+                    pregunta_subir = f"  ¿Subir también a Externo? (s/{d}N{r}): " if remoto \
+                        else f"  ¿Copiar también a Externo? (s/{d}N{r}): "
+                    if self.ui.leer(pregunta_subir).lower() == "s":
+                        datos = resuelto if not ext_cifrado \
+                            else self._bytes_para_externo(g, stem, ev_path, True)
+                        if datos is not None:
+                            if remoto:
+                                try:
+                                    await remote_write_async(src_str, datos)
+                                    print(f"{C('plus')}  ✓ Externo actualizado{r}")
+                                except Exception as e:
+                                    print(f"Error subiendo: {e}")
+                            else:
+                                Path(src_str).write_bytes(datos)
+                                print(f"{C('plus')}  ✓ Externo actualizado{r}")
+                    break
+                elif res == "e":
+                    if modo_cifrado:
+                        key_id = self.storage.key_id_vigente(g, stem) if es_gpg else None
+                        if es_gpg and not key_id:
+                            print(f"  {w}No hay clave GPG registrada para re-cifrar el Vault; no se cambia nada.{r}")
+                            break
+                        self.storage.escribir_entrada(g, stem, ext_plano, key_id=key_id, cifrar=bool(es_gpg))
+                    elif remoto:
+                        self.storage.escribir_entrada(g, stem, contenido_remoto_cache, cifrar=False)
                     else:
                         shutil.copy2(Path(src_str), ev_path)
                     self.storage._invalidar_cache_grupo(g)
                     self.ui.invalidar_cache_abreviaturas(g)
                     if not es_gpg:
                         self.storage.registry.set_type(g, stem, detectar_tipo_archivo(ev_path))
-                    print(f"{C('plus')}  ✓ Entrada actualizada{r}")
+                    print(f"{C('plus')}  ✓ Vault actualizado{r}")
                     break
-                elif res == "e":
-                    if es_remoto(src_str):
+                elif res == "v":
+                    datos = self._bytes_para_externo(g, stem, ev_path, ext_cifrado)
+                    if datos is None:
+                        break
+                    if remoto:
                         try:
-                            contenido = self.storage.leer_entrada(g, stem)
-                            if contenido is None:
-                                print("Error leyendo entrada")
-                                break
-                            await remote_write_async(src_str, contenido)
-                            print(f"{C('plus')}  ✓ Origen remoto actualizado{r}")
+                            await remote_write_async(src_str, datos)
+                            print(f"{C('plus')}  ✓ Externo actualizado{r}")
                         except Exception as e:
                             print(f"Error subiendo: {e}")
                     else:
-                        shutil.copy2(ev_path, Path(src_str))
-                        print(f"{C('plus')}  ✓ Origen actualizado{r}")
+                        Path(src_str).write_bytes(datos)
+                        print(f"{C('plus')}  ✓ Externo actualizado{r}")
                     break
+                elif res in ("d", "f") and es_bin:
+                    print(f"  {w}Es binario: no hay diff ni fusión; usa [m]d5.{r}")
                 else:
                     print(f"{d}  Omitido{r}")
                     break
         print(f"{d}Revisión completada.{r}")
         self.ui.update_all_abbreviations()
         print(f"{d}Caché de abreviaturas actualizada.{r}")
+
+    def _mostrar_info_entrada(self, grupo: str, stem: str) -> None:
+        """Vista detallada de una entrada:
+        - sin nota: nombre completo (sin abreviar) + ruta básica desde el vault.
+        - con nota: nota primero, luego badges (cifrado/binario/versiones),
+          enlaces y versiones, todo en secciones separadas y legibles."""
+        d, r, w, h = C("date"), C("rst"), C("warn"), C("header")
+        reg = self.storage.registry
+        ev_path = self.storage.get_entrada_path(grupo, stem)
+        txt = reg.get_info(grupo, stem)
+        origins = reg.get_origins(grupo, stem)
+        protegido = reg.is_protected(grupo, stem)
+        tipo = reg.get_type(grupo, stem)
+        versiones = self.storage.listar_versiones(grupo, stem)
+
+        if ev_path:
+            ext = ev_path.suffix if ev_path.suffix.lower() != ".gpg" else (Path(ev_path.stem).suffix or "")
+        else:
+            ext = ""
+        nombre_completo = f"{grupo}/{stem}{ext}"
+
+        print()
+        print(f"{C('bold')}{nombre_completo}{r}")
+        if not txt:
+            print(f"  {d}(sin nota){r}")
+        else:
+            print(f"  {d}{txt}{r}")
+
+        etiquetas = []
+        if protegido:
+            etiquetas.append(f"{w}g{r} cifrado → {self.storage.key_id_vigente(grupo, stem)}")
+        if tipo == "binary":
+            etiquetas.append(f"{d}b{r} binario")
+        if versiones:
+            etiquetas.append(f"{d}{len(versiones)} versión(es){r}")
+        if etiquetas:
+            sep_et = f"  {d}·{r}  "
+            print(f"  {sep_et.join(etiquetas)}")
+
+        if origins:
+            print(f"\n  {h}Enlaces:{r}")
+            for o in origins:
+                if es_remoto(o):
+                    marca = f"{C('link')}r{r}"
+                elif Path(o).is_file():
+                    marca = f"{C('link')}c{r}"
+                else:
+                    marca = f"{C('minus')}x{r}"
+                print(f"    [{marca}] {d}{self.ui._fmt_origin(o)}{r}")
+
+        if versiones:
+            print(f"\n  {h}Versiones:{r}")
+            for i, vpath in enumerate(versiones, 1):
+                print(f"    [{i}] {d}{self._fmt_version_fecha(vpath)}{r}")
+        print()
 
     def cmd_info(self, args: List[str]) -> None:
         if not args:
@@ -2137,26 +2818,12 @@ class ByteApp:
             print(f"No encontrado: '{args[0]}'")
             return
         if stem is not None:
-            ruta_fmt = self.ui.render_ruta(grupo, stem)
-            d, r, w = C("date"), C("rst"), C("warn")
             if len(args) >= 2:
+                ruta_fmt = self.ui.render_ruta(grupo, stem)
                 self.storage.registry.set_info(grupo, stem, " ".join(args[1:]))
-                print(f"{d}Nota guardada para {ruta_fmt}{r}")
+                print(f"{C('date')}Nota guardada para {ruta_fmt}{C('rst')}")
                 return
-            txt = self.storage.registry.get_info(grupo, stem)
-            if txt:
-                print(f"{d}{txt}{r}")
-            if self.storage.registry.is_protected(grupo, stem):
-                print(f"{w}Cifrado: {self.storage.registry.key_id(grupo, stem)}{r}")
-            if self.storage.registry.get_type(grupo, stem) == "binary":
-                print("Tipo: binario")
-            for origin in self.storage.registry.get_origins(grupo, stem):
-                print(f"  → {d}{self.ui._fmt_origin(origin)}{r}")
-            versiones = self.storage.listar_versiones(grupo, stem)
-            if versiones:
-                print(f"\n  {C('header')}Versiones:{C('rst')}")
-                for i, vpath in enumerate(versiones, 1):
-                    print(f"    [{i}] {C('date')}{self._fmt_version_fecha(vpath)}{C('rst')}")
+            self._mostrar_info_entrada(grupo, stem)
             return
         evs = self.storage.get_entradas(grupo)
         if not evs:
@@ -2310,6 +2977,7 @@ class ByteApp:
                         ev_actual, versiones[0],
                         label_a=f"actual           {fecha_actual}",
                         label_b=f"versión más rec. {fecha_version}",
+                        nombre_a="actual", nombre_b="versión",
                     )
                 return await self.cmd_restore([entrada])
             if not op.isdigit():
@@ -2420,7 +3088,7 @@ class ByteApp:
         print(f"  {t}--info    {d}i{r}  {d}[entrada] [texto]{r}    nota corta (y enlaces)")
         print(f"  {t}--gpg     {d}g{r}  entrada              cifra con GPG")
         print(f"  {t}--nogpg   {d}q{r}  entrada              descifra")
-        print(f"  {t}--check   {d}c{r}                      verifica configuración y enlaces")
+        print(f"  {t}--check   {d}c{r}                      verifica config, enlaces (con opción fusionar)")
         print(f"  {t}--config  {d}x{r}                      configuración (incluye diff_tool)")
         print(f"  {t}--search  {d}s{r}  texto {d}[grupo]{r}       busca con rg/grep")
         print(f"  {t}--version {d}v{r}  entrada              guarda versión")
